@@ -1,0 +1,1 @@
+[{"start": "0x0026C9C0", "observed": true, "note": "XPP init routine reached only through a pointer table (boot1 ICALL failure)."}]

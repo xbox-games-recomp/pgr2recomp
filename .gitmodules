@@ -1,0 +1,7 @@
+[submodule "xboxrecomp"]
+	path = xboxrecomp
+	url = https://github.com/sp00nznet/xboxrecomp.git
+	ignore = dirty
+[submodule "launcher"]
+	path = launcher
+	url = https://github.com/xbox-games-recomp/xbox-recomp-launcher.git
