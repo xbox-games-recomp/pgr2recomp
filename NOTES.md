@@ -164,9 +164,61 @@ in 120 s. Not checked: audio, input past the title screen, anything in game.
 Open from this run: NtQueryVolumeInformationFile class 1 (FileFsVolumeInformation) on `UDATA\4d53004b\` returns
 STATUS_NOT_IMPLEMENTED (save-game code; watch for save problems).
 
+## 10. Stuck at car selection: functions reached only through immediates (seeds)
+
+Symptom (user's `run.log`): after picking an event, car selection kept rendering but A did nothing. The log had a
+single `[ICALL] Failed to resolve VA 0x00052F70`. `sub_000AA000` / `sub_000AA230` map the game mode (13 cases) to
+a callback with `mov eax, imm32; ret 4`, and the caller stores it in `[0x34E938]`; mode 5's callback `0x00052F70`
+was never found by the disassembler (no direct call, no data pointer), so the call returned 0 and the mode never
+started. Seeded (`config\seed_functions.json`).
+
+Same class, found by scanning every `.text` instruction operand and every aligned `.data`/`.rdata` dword for
+values that land on a plausible, unknown function start: `0x0005A9C0`, `0x0009C040`, `0x001774D0` (pushed or
+stored as callbacks) and two atexit thunks. **Only seed addresses that follow int3 padding** (or are observed):
+`0x001510F0` follows a `ret` but is a block of `sub_00150A00` that the title only *compares* against; seeding it
+split that function, its jump table landed in the new piece (`[ICALL] 0x00151CA2`) and the game ran into null
+pointers within seconds. `0x00081B40` / `0x0008F350` were dropped for the same reason.
+
+The race needs more of the same in the CRT's x87 maths (`exp`/`sinh`/`cosh`/`tanh`, pow-style helpers): the CRT
+dispatches through byte-packed tables (name, flags, four handler addresses -- **unaligned**, at `0x002966FA..`)
+and an aligned table at `0x00296130`, and the handlers tail-jump into each other. Seeded every missing table
+entry (`0x001B5BC8 .. 0x001B9EB5`, `0x001B5BD0`, `0x001B5C72`) and the stub target `0x001B5C74`. Symptoms before:
+`[ICALL] Failed 0x001B9E14` every frame once an attract-mode car's audio set loaded, `0x001B5BD0` in the race.
+Stubs after the final regen: see 12.
+
+## 11. Streamer deadlock: file I/O completions must be deferred (`RECOMP_DEFER_IO_APC`)
+
+Symptom: pressing Start in the attract demo (or any front end <-> game switch) froze the picture; no more flips.
+cdb host stacks: main thread in `sub_00100AC0` -> WaitForSingleObject(streamer thread, INFINITE); the streamer
+thread (`sub_001009E0`) had seen its quit event and sat in `sub_00136070`, an alertable WaitAll loop that runs
+while the pending-read mask `[esi+0x5C]` is non-zero. `sub_00136360` issues `ReadFileEx(..., 0x001362F0)` and
+**then** ORs the request's bit into the mask; the completion routine clears it. The toolkit ran file APCs inline
+inside NtReadFile, so the completion ran before the bit was set and the bit never cleared (the toolkit comment cites
+Fallout: BoS doing the same). The toolkit already has hardware-style deferral (APC queued per thread, run at the
+next alertable user-mode wait): `src\main.c` now calls `xbox_SetDeferredIoApc(1)`. `RECOMP_DEFER_IO_APC=0`
+reverts. With it, attract -> title -> front end -> race all switch cleanly; A/B with `=0` (run `ab0`): Start in
+the attract demo freezes again (flips stop).
+
+## 12. Milestone: front end and a race (2026-11-01)
+
+`scripts\dev\to_carselect.ps1 <tag> [-race]` (fresh profile in `saveroot\UDATA`, Z: cache kept): Start at the
+title before the attract demo starts (A at the title starts the attract demo), plate / plate text / helmet,
+Single Player -> Kudos World Series -> Compact Sports Series -> Street Race (Florence) -> **car selection ->
+transmission -> difficulty -> pre-race -> race**. Verified in frame dumps (`frames\race1`, `frames\race2`): every
+menu, the Florence street race with HUD, AI cars, and scripted throttle (`rt:6000` in the live pad file) driving
+the car to 40-50 mph in 2nd. The attract demo renders Hong Kong / other cities with cars driving. No XOnline wait
+anywhere ("Not signed in to Xbox Live" on the scoreboard).
+
+Open: the player's car (dark green MINI) renders almost black in the race (not checked against xemu); audio not
+checked; driving feel / window needs the user. One of four scripted runs (`race2`) crashed during the race load in
+DirectSound on the APU interrupt path (`[CRASH]` AV in `sub_001F25D7`, `edi=0xFFFFFFB4`); `race1`/`race3`/`r5`
+on the same seeds minus three CRT entries / the same build did not. Intermittent, not investigated (MM3 #11/#31
+are the DSOUND precedents).
+Stubs after the final regen: 6 (`0x00128B89`, `0x00177C76/7E`, `0x001D78E7/EB`, `0x00275626`), none hit in race3.
+
 ## Next
 
-1. Press Start (`RECOMP_PAD_PRESS=0x10` / `scripts\dev\press.ps1`) and follow the front end; XOnline sign-in
-   prompts are likely (stub XNet/XOnline to "no network" as in MM3 if it waits).
-2. A race, then audio (`RECOMP_AUDIO_WAV`), then the user's eyes on the window.
+1. The user drives a full race (window, input feel, audio); the black player car (xemu shader cache comparison).
+2. More CRT x87 entries may surface as `[ICALL] Failed 0x001B5xxx/0x001B9xxx`: seed the table entry / stub
+   target (10). SEH handlers referenced from `.rdata` (`0x001B2F48`, `0x001B85D9`, ...) are not seeded.
 3. The toolkit fixes in 7 are game-agnostic: carry them to rsc2recomp/mm3recomp's patch when convenient.

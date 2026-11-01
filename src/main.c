@@ -481,6 +481,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     printf("Initializing kernel bridge...\n");
     xbox_kernel_bridge_init();
 
+    /* File I/O completion routines run at the issuing thread's next alertable wait, as on
+     * hardware, not inside NtReadFile. The streamer (sub_00136360) sets its "read pending" bit
+     * after ReadFileEx returns; run inline, the completion cleared the bit before it was set and
+     * stopping the streamer (sub_00136070) waited forever (NOTES 10). RECOMP_DEFER_IO_APC=0 reverts. */
+    {
+        extern void xbox_SetDeferredIoApc(int on);
+        const char *e = getenv("RECOMP_DEFER_IO_APC");
+        xbox_SetDeferredIoApc(!(e && *e == '0'));
+    }
+
     /* Step 6: Initialize stack */
     g_esp = XBOX_STACK_TOP;
 
