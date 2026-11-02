@@ -216,9 +216,68 @@ on the same seeds minus three CRT entries / the same build did not. Intermittent
 are the DSOUND precedents).
 Stubs after the final regen: 6 (`0x00128B89`, `0x00177C76/7E`, `0x001D78E7/EB`, `0x00275626`), none hit in race3.
 
+## 13. Races ran at double speed: flip pacing (`RECOMP_FLIP_PACING=1`)
+
+Symptom (user, driving): everything in the race moved twice as fast. Measured from frame dumps: the in-game lap
+clock advanced exactly flips/30 (266 flips -> 8.85 s, 228 -> 7.6 s, whatever the wall time), so PGR2 steps a fixed
+1/30 s per frame and relies on its swaps' presentation interval 2 to hold it at 30 fps. The toolkit completed every
+FLIP_STALL at once, so the race flipped at the host's 60 Hz (or faster with vsync off). The toolkit's flip hold
+(`nv2a_flip_hold.h`: holds the GPU after a FLIP_STALL until the guest vblank count reaches last flip + the
+interval from D3D's swap NOP) is opt-in; `RECOMP_FLIP_PACING=1` is now in `launcher.ini` and `scripts\dev\live.ps1`.
+Run `pace1` (vsync off, so nothing else caps the rate): the race at exactly 30 flips/s (600 in 20 s) and the lap
+clock 15.000 s over 15 s of wall time; menus and movies keep 60 (they ask for interval 1). Unset or `=0` reverts.
+It needs `RECOMP_VBLANK` (the guest vblank clock). A machine that cannot hold 30 fps still runs slow (headless
+runs without it reached ~23 fps in races).
+
+Probes added to `src\d3d11_backend.c` while looking at the user's alpha-masked buildings: the batch log
+(`RECOMP_D3D11_LOGFRAME` / `_LOGFILE`) prints `aref` (alpha reference), and `RECOMP_D3D11_NOATEST=1` ignores the
+alpha test. On the Florence grid the alpha-tested draws are the overhead cables (refs 0/1/45/128) and work; the
+far bank of the river (user's screenshot at ~38 s into lap 1: flat water to the horizon, bare poles) is not
+reproduced yet.
+
+## 14. Streets of buildings that vanish: the lifter's 8-bit `imul` (fixed in the toolkit)
+
+User recording `flicker61101_123328`, frames 119-232: the start straight of Florence shows no buildings on
+either side (sky and a flat "river" to the horizon) until frame 232, when the whole street appears from one frame
+to the next at the same position. The "river" of the earlier screenshot is this, and the alpha-masked buildings
+of 13 too.
+
+**Cause.** `sub_001194E0` (track load) gives every draw item of a city chunk its sort key:
+`mov bl, 5; imul bl; add al, [esi+5]; mov [edx+2], al` at 0x0011956A (key = class * 5 + the material's byte 5).
+The lifter emitted every one-operand `imul`/`mul`/`div`/`idiv` as the dword form (EDX:EAX), so `imul bl` zeroed
+EDX, the item pointer, and the key went to guest address 2. Every item kept its file's placeholder key 6. The
+draws of visible chunks go through a counting sort on that key (`sub_0011B1B0` add, `sub_0011B210` sort,
+`sub_0011B410` draws keys <= 79, then the rest after restoring depth writes and the z bias). With one key, the
+list stays in chunk order. Its multiply decals (material type 16) and alpha overlays (type 18), which set
+DEPTH_MASK = 0 and a z bias through the game's own state cache (`0x486149`, `sub_00118D90`), land in the middle
+of it. Every opaque item after the first decal is then drawn without depth writes, and the sky dome (`46B9DE93`,
+LEQUAL, drawn last) paints over it. Whether a decal chunk comes early depends on where the camera is: hence
+streets that vanish at one spot and come back at another.
+
+Fix: `tools/recomp/lifter.py` `_narrow_muldiv` lifts the 8-bit forms on AX (AL * r/m8 into AX; AX / r/m8 into
+AL, AH) and the 16-bit forms on DX:AX, leaving the rest of EAX/EDX alone (toolkit patch). Game-agnostic: every
+`mul`/`imul`/`div`/`idiv r/m8|r/m16` in any port was wrong before.
+
+How it was found (the method generalises to "wrong draw state"): two F12 captures from the user (street missing
+at f1208 / present at f1268, both with the batch log). The same draws were in both frames, but in the bad one a
+decal ran at b753 and the next ~470 buildings had `dw0`. A temporary probe recorded the guest stack at every
+DEPTH_MASK write in the game's one-method helper `sub_001C0E00`, keyed by pushbuffer address. The executor
+carried the address into each batch, so the log showed the call chain behind each `dw` switch. A dump of the
+sorted list then showed all keys = 6 and the decal in mid-list.
+
+Kept from the investigation (harmless, correct):
+- `depth_scale()` normalised depth by each draw's clip maximum. xemu (master, `pgraph/glsl/psh.c` + `common.c`)
+  stores w (w-buffer) or screen z at the depth buffer's full scale (16777215 / 65535) and uses the clip range only
+  to discard/clamp. Changed to that (`Nv2aRenderState.zeta_format`, new; toolkit patch);
+  `RECOMP_D3D11_ZSCALE_CLIP=1` reverts.
+- `RECOMP_ZPASS_FORCE=<pixels>` (toolkit probe) answers every visibility test with that count; forcing them all
+  visible floods the screen with sun glare (the game tests the sun).
+- F12 also logs every batch of the next flip to stderr (`[D3D11] F12: logging flip N`, then `f<N> b...`).
+
 ## Next
 
 1. The user drives a full race (window, input feel, audio); the black player car (xemu shader cache comparison).
 2. More CRT x87 entries may surface as `[ICALL] Failed 0x001B5xxx/0x001B9xxx`: seed the table entry / stub
    target (10). SEH handlers referenced from `.rdata` (`0x001B2F48`, `0x001B85D9`, ...) are not seeded.
-3. The toolkit fixes in 7 are game-agnostic: carry them to rsc2recomp/mm3recomp's patch when convenient.
+3. The toolkit fixes in 7 and 14 (narrow mul/div) are game-agnostic: carry them to rsc2recomp/mm3recomp's patch
+   when convenient (14 especially: any `imul r/m8` there is mis-lifted too).

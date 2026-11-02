@@ -1648,8 +1648,18 @@ static int wbuffer_on(const Nv2aRenderState *rs)
     return on && s_psw && (rs->control0 & 0x00010000u) != 0;
 }
 
+/* Depth (z, or w when w-buffered) is stored relative to the depth buffer's full scale,
+ * 65535 for Z16 and 16777215 for Z24S8, as xemu does; the clip range (SET_CLIP_MIN/MAX)
+ * only decides what is discarded. Scaling by the clip maximum made each draw's depth
+ * relative to its own range (PGR2's sky uses a far clip of 2.13e7 against the scene's
+ * 2^24; NOTES 14, where this turned out not to be the cause). With no depth buffer, or
+ * RECOMP_D3D11_ZSCALE_CLIP=1, the clip maximum as before. */
 static float depth_scale(const Nv2aRenderState *rs)
 {
+    static int clip = -1;
+    if (clip < 0) { const char *e = getenv("RECOMP_D3D11_ZSCALE_CLIP"); clip = e && e[0] == '1'; }
+    if (!clip && rs->zeta_format == 1) return 1.0f / 65535.0f;
+    if (!clip && rs->zeta_format == 2) return 1.0f / 16777215.0f;
     return rs->depth_max > 1.5f ? 1.0f / rs->depth_max : 1.0f;
 }
 
@@ -1667,13 +1677,19 @@ static void set_viewport(uint32_t w, uint32_t h)
 /* RECOMP_D3D11_LOGFILE: the flip to log once the trigger file appears (see be_draw_ext).
  * Polled at most once per flip. */
 static long s_logstep_a = -1, s_logstep_b = -1;
+/* F12 (flight recorder) also logs the batches of the next flip, as the trigger file does. */
+static volatile LONG s_log_f12;
 static int logfile_flip(void)
 {
     static const char *path = (const char *)1;
     static uint64_t polled = (uint64_t)-1, armed = (uint64_t)-1;
     if (path == (const char *)1) path = getenv("RECOMP_D3D11_LOGFILE");
-    if (!path) return 0;
-    if (polled != s_flip_count) {
+    if (polled != s_flip_count && armed == (uint64_t)-1 && InterlockedExchange(&s_log_f12, 0)) {
+        armed = s_flip_count + 1;
+        fprintf(stderr, "[D3D11] F12: logging flip %llu\n", (unsigned long long)armed);
+    }
+    if (!path && armed == (uint64_t)-1) return 0;
+    if (path && polled != s_flip_count) {
         polled = s_flip_count;
         if (armed == (uint64_t)-1 && GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
             FILE *f = fopen(path, "r");      /* optional "<from>-<to>": the RECOMP_D3D11_LOGSTEP batch range */
@@ -1756,8 +1772,9 @@ static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
     }
     if ((flags & 3) && (z = get_zb(rs->zeta_va, s->width, s->height)) != NULL) {
         UINT cf = ((flags & 1) ? D3D11_CLEAR_DEPTH : 0) | ((flags & 2) ? D3D11_CLEAR_STENCIL : 0);
-        float d = rs->depth_max > 70000.0f ? (float)(zstencil >> 8) / 16777215.0f
-                                           : (float)(zstencil & 0xFFFF) / 65535.0f;
+        int z24 = rs->zeta_format ? rs->zeta_format == 2 : rs->depth_max > 70000.0f;
+        float d = z24 ? (float)(zstencil >> 8) / 16777215.0f
+                      : (float)(zstencil & 0xFFFF) / 65535.0f;
         if (s->width < z->w || s->height < z->h) {
             static unsigned nsmall;
             if (nsmall++ < 40)
@@ -1845,12 +1862,12 @@ static void log_batch(uint64_t idx, const Nv2aSurface *s, const Nv2aBatch *b, co
 {
     const Nv2aRenderState *rs = b->state;
     uint32_t st;
-    fprintf(stderr, "[D3D11] f%llu b%llu rt %08X %ux%u aa%u tris %u z %08X dt%u/%X dw%u blend %u %X/%X ct%u af%X/%u cull %u/%X/%X "
+    fprintf(stderr, "[D3D11] f%llu b%llu rt %08X %ux%u aa%u tris %u z %08X dt%u/%X dw%u blend %u %X/%X ct%u af%X/%u aref %u cull %u/%X/%X "
             "rc %u n=%u sp=%07X fin %08X %08X vsh %08X zr %g..%g\n",
             (unsigned long long)s_flip_count, (unsigned long long)idx, s->color_va, s->width, s->height, s->aa_sx,
             b->count / 3, rs->zeta_va, rs->depth_test_enable, rs->depth_func, rs->depth_write,
             rs->blend_enable, rs->blend_src, rs->blend_dst, rs->color_mask, rs->alpha_test_enable,
-            rs->alpha_func, rs->cull_enable, rs->cull_face, rs->front_face,
+            rs->alpha_func, rs->alpha_ref, rs->cull_enable, rs->cull_face, rs->front_face,
             x->use_rc, x->rc.control & 0xFF, x->rc.stage_program, x->rc.final0, x->rc.final1, x->vsh_hash, rs->depth_min, rs->depth_max);
     for (st = 0; st < 8; st++)
         if (st < (x->rc.control & 0xFF) || x->rc.color_icw[st] || x->rc.color_ocw[st] || x->rc.alpha_icw[st] || x->rc.alpha_ocw[st])
@@ -3107,10 +3124,16 @@ vertices_ready:
         d->valid0 = x->stage[0].valid; d->srv0 = srvs[0] != NULL || cubes[0] != NULL;
         d->blend = rs->blend_enable; d->cmask = rs->color_mask;
     }
+    {   /* RECOMP_D3D11_NOATEST=1: ignore the alpha test (probe) */
+        static int noat = -1;
+        if (noat < 0) noat = getenv("RECOMP_D3D11_NOATEST") != NULL;
+        if (noat) goto no_atest;
+    }
     if (rs->alpha_test_enable) {
         uint32_t f = rs->alpha_func >= 0x200 && rs->alpha_func <= 0x207 ? rs->alpha_func - 0x200 : 7;
         cb.flags |= 2 | (f << 4);
     }
+no_atest:
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         memcpy(m.pData, &cb, sizeof cb);
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb, 0);
@@ -4357,6 +4380,7 @@ static void ring_flip(RT *r)
         }
         if (sf) fclose(sf);
         fprintf(stderr, "[D3D11] flight recorder: wrote %d frames to %s\n", s_ring_fill, dir);
+        InterlockedExchange(&s_log_f12, 1);   /* and the batches of the next flip (logfile_flip) */
         if (s_hwnd) SetWindowTextA(s_hwnd, "Project Gotham Racing 2 (D3D11) - frames saved (F12)");
     }
 }

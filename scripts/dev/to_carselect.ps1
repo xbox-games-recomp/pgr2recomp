@@ -1,9 +1,10 @@
 # to_carselect.ps1 <tag> [-exe <path>] [-race]: fresh profile in saveroot, boot (live.ps1), Start at the title,
 # create the profile (plate, plate text, helmet), Single Player -> Kudos World Series -> Compact Sports Series ->
-# Street Race (Florence) -> car selection. -race carries on: MINI Cooper S, Auto, Novice, Start Race, then 6 s of
+# Street Race (Florence) -> car selection. -race carries on: MINI Cooper S, Auto, Novice, Start Race, then -drive ms of
 # throttle. Leaves the game running; frames in frames\<tag>, log in <tag>.err, the screen after each step in
 # frames\<tag>_now.png.
-param([string]$tag, [string]$exe = "build\Release\pgr2_recomp.exe", [switch]$race, [string]$extraEnv = "")
+param([string]$tag, [string]$exe = "build\Release\pgr2_recomp.exe", [switch]$race, [int]$drive = 6000,
+      [string]$extraEnv = "")
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $press = "$PSScriptRoot\press.ps1"
 Set-Location $repo
@@ -26,5 +27,7 @@ if (-not $race) { return }
 & $press $tag -wait 25 a    # Auto transmission -> difficulty
 & $press $tag -wait 40 a    # Novice -> pre-race
 & $press $tag -wait 60 a    # Start Race -> grid
-"rt:6000" | Out-File "$repo\pad_live.txt" -Append -Encoding ascii
-& $press $tag -wait 7
+if ($drive -gt 0) {
+    "rt:$drive" | Out-File "$repo\pad_live.txt" -Append -Encoding ascii
+    & $press $tag -wait ([int][math]::Ceiling($drive / 1000) + 1)
+}
