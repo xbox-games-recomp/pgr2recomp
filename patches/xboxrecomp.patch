@@ -1,8 +1,23 @@
 diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
-index 7746ae3..1d199f1 100644
+index 7746ae3..0ede21d 100644
 --- a/src/apu/apu_core.c
 +++ b/src/apu/apu_core.c
-@@ -1109,7 +1109,7 @@ static void apu_irq_stats_line(void)
+@@ -263,6 +263,14 @@ static int apu_call_isr(void)
+     fn = routine ? recomp_lookup(routine) : NULL;
+     if (!fn)
+         return -1;
++    if (g_state) {
++        /* Now, with the routine about to run, not when the trap was posted:
++         * see mcpx_apu_vp_retract_stale_idle_trap. */
++        qemu_mutex_lock(&g_state->lock);
++        if (mcpx_apu_vp_retract_stale_idle_trap(g_state))
++            update_irq(g_state);
++        qemu_mutex_unlock(&g_state->lock);
++    }
+     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
+     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
+     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
+@@ -1109,7 +1117,7 @@ static void apu_irq_stats_line(void)
      uint64_t now;
  
      if (s_irq_trace < 0)
@@ -11,11 +26,130 @@ index 7746ae3..1d199f1 100644
      if (!s_irq_trace)
          return;
      now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+diff --git a/src/apu/apu_dsp.c b/src/apu/apu_dsp.c
+index bd36f2a..e590431 100644
+--- a/src/apu/apu_dsp.c
++++ b/src/apu/apu_dsp.c
+@@ -101,19 +101,55 @@ static void dsp_ack_init(void)
+ 
+ /* SUM EVERY MIXBIN THE GUEST ROUTED TO, NOT JUST THE FIRST TWO.
+  *
+- * Default ON. RECOMP_APU_MIXDOWN_ALL=0 restores the previous two-bin read,
+- * because this changes audible output for every title and an escape hatch
+- * costs one branch. */
++ * RECOMP_APU_MIXDOWN_ALL=0 restores the two-bin read, =1 the sum of every
++ * bin by parity (below). Unset: the speaker mixdown (mcpx_apu_speaker_mix),
++ * which also counts every bin a voice can be heard through, but not the
++ * effect sends. */
+ static int mcpx_apu_mixdown_all(void)
+ {
+     static int on = -1;
+     if (on < 0) {
+         const char *e = getenv("RECOMP_APU_MIXDOWN_ALL");
+-        on = (e && *e) ? (atoi(e) != 0) : 1;
++        on = (e && *e) ? (atoi(e) != 0 ? 1 : 0) : 2;
+     }
+     return on;
+ }
+ 
++/* DirectSound's mixbins (XDK 5xxx DSMIXBIN_*): 0 front left, 1 front right,
++ * 2 centre, 3 LFE, 4 back left, 5 back right, 6 to 9 the crosstalk submixes
++ * of 3D voices (front left/right, back left/right), 10 the I3DL2 reverb
++ * send, 11 to 30 effect sends (FXSEND_0..19): the inputs of the effect
++ * chains in the title's GP image, which mix their outputs to the speakers.
++ *
++ * The parity sum (=1) treated every send as a speaker of the side its
++ * number fell on. Project Gotham Racing 2 drives sends harder than the dry
++ * pair: in a race each engine and effect voice goes to the front pair at
++ * its pan and to FXSEND 1..3 (bins 12-14) 6-10 dB louder; in car selection
++ * the music's front pair is muted and it plays through bin 24 alone (both
++ * channels summed into one send, so the send is mono). By parity all of
++ * bins 12, 14 and 24 landed on the left: the front end was 13 dB louder on
++ * the left and a race was almost entirely on it, with the right carrying
++ * only bin 13.
++ *
++ * The GP is a stub, so what an effect chain does (EQ, compression, its own
++ * pan) is unknown here. This takes its output to be its input, centred:
++ * every effect send goes to both sides at equal power. The reverb send
++ * carries a dry copy, so it goes in at half that; the crosstalk bins keep
++ * their sides (Jet Set Radio Future's 3D voices, bins 6 to 10, were why the
++ * parity sum was written). */
++static void mcpx_apu_speaker_mix(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
++                                 int i, float *left, float *right)
++{
++    const float c = 0.7071f;
++    float mono = c * (mixbins[2][i] + mixbins[3][i]) + 0.5f * c * mixbins[10][i];
++    float l = mixbins[0][i] + mixbins[4][i] + mixbins[6][i] + mixbins[8][i];
++    float r = mixbins[1][i] + mixbins[5][i] + mixbins[7][i] + mixbins[9][i];
++    for (int b = 11; b < NUM_MIXBINS; b++)
++        mono += c * mixbins[b][i];
++    *left = l + mono;
++    *right = r + mono;
++}
++
+ /* GPRST (GP region + 0xFFFC): the GP runs only with both reset bits set, as
+  * in xemu's gp_write. Nothing else models the GP, so this is kept for the
+  * =auto ack alone. Before the first write the GP counts as running: a title
+@@ -278,7 +314,9 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
+              * counts. This is not what a real EP does; it is the cheapest
+              * mixdown that stops discarding audio. */
+             float left, right;
+-            if (mcpx_apu_mixdown_all()) {
++            if (mcpx_apu_mixdown_all() == 2) {
++                mcpx_apu_speaker_mix(mixbins, i, &left, &right);
++            } else if (mcpx_apu_mixdown_all()) {
+                 left = 0.0f;
+                 right = 0.0f;
+                 for (int b = 0; b < NUM_MIXBINS; ++b) {
+diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
+index 7318675..ef4fa6c 100644
+--- a/src/apu/apu_state.h
++++ b/src/apu/apu_state.h
+@@ -535,6 +535,7 @@ void mcpx_apu_vp_init(MCPXAPUState *d);
+ void mcpx_apu_vp_finalize(MCPXAPUState *d);
+ void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
+ void mcpx_apu_vp_reset(MCPXAPUState *d);
++int mcpx_apu_vp_retract_stale_idle_trap(MCPXAPUState *d);
+ 
+ /* DSP functions (stubbed) */
+ void mcpx_apu_dsp_init(MCPXAPUState *d);
 diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
-index 3ec56ca..9d0dee0 100644
+index 3ec56ca..80a8436 100644
 --- a/src/apu/apu_vp.c
 +++ b/src/apu/apu_vp.c
-@@ -195,6 +195,15 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+@@ -124,6 +124,31 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
+                 v | ((val << ctz32(mask)) & mask));
+ }
+ 
++/* A voice whose block is all zero apart from its link: nothing has
++ * programmed it. A list walk only reaches one through a link read while the
++ * title was rewriting a block -- XDK DSOUND's release zeroes the block
++ * (rep stosd) before it writes the self-link that marks "unlinked", so for a
++ * moment the link reads 0 and leads to voice 0. */
++static bool voice_is_blank(MCPXAPUState *d, uint16_t voice_handle)
++{
++    hwaddr voice = d->regs[NV_PAPU_VPVADDR] + voice_handle * NV_PAVS_SIZE;
++    for (hwaddr o = 0; o < NV_PAVS_SIZE; o += 4)
++        if (o != NV_PAVS_VOICE_TAR_PITCH_LINK &&
++            ldl_le_phys(address_space_memory, voice + o))
++            return false;
++    return true;
++}
++
++static int apu_stale_trap_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("RECOMP_APU_STALE_TRAP");
++        on = !(e && e[0] == '0');
++    }
++    return on;
++}
++
+ /* ============================================================
+  * Voice off / lock
+  * ============================================================ */
+@@ -195,6 +220,15 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
  
      d->regs[NV_PAPU_FEDECMETH] = method;
      d->regs[NV_PAPU_FEDECPARAM] = argument;
@@ -31,17 +165,173 @@ index 3ec56ca..9d0dee0 100644
      unsigned int selected_handle, list;
  
      switch (method) {
-@@ -774,7 +783,7 @@ static unsigned s_vstat_frames, s_vstat_secs;
+@@ -491,6 +525,12 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+         d->vp.hrtf_submix[1] = (uint8_t)((argument >> 8) & 0x1f);
+         d->vp.hrtf_submix[2] = (uint8_t)((argument >> 16) & 0x1f);
+         d->vp.hrtf_submix[3] = (uint8_t)((argument >> 24) & 0x1f);
++        {
++            static int nlog;
++            if (nlog++ < 8)
++                fprintf(stderr, "[APU] HRTF submixes %u %u %u %u\n", d->vp.hrtf_submix[0],
++                        d->vp.hrtf_submix[1], d->vp.hrtf_submix[2], d->vp.hrtf_submix[3]);
++        }
+         break;
+ 
+     case NV1BA0_PIO_SET_HRTF_HEADROOM:
+@@ -544,6 +584,13 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+                    method <= NV1BA0_PIO_SET_SUBMIX_HEADROOM + 4 * (NUM_MIXBINS - 1)) {
+             assert((method & 3) == 0);
+             slot = (method - NV1BA0_PIO_SET_SUBMIX_HEADROOM) / 4;
++            if (d->vp.submix_headroom[slot] != (uint8_t)(argument & NV1BA0_PIO_SET_SUBMIX_HEADROOM_AMOUNT)) {
++                static int nlog;
++                if (nlog++ < 64)
++                    fprintf(stderr, "[APU] submix %u headroom %u -> %u\n", slot,
++                            d->vp.submix_headroom[slot],
++                            (unsigned)(argument & NV1BA0_PIO_SET_SUBMIX_HEADROOM_AMOUNT));
++            }
+             d->vp.submix_headroom[slot] =
+                 (uint8_t)(argument & NV1BA0_PIO_SET_SUBMIX_HEADROOM_AMOUNT);
+         } else if ((method >= NV1BA0_PIO_SET_OUTBUF_BA &&
+@@ -760,10 +807,13 @@ struct VpVoiceStat {
+     uint32_t addr, fmt;
+     uint16_t vol0, vol1;
+     uint8_t  bin0, bin1;
++    uint16_t volx[8];               /* all eight pairs, for RECOMP_APU_VOICES=2 */
++    uint8_t  binx[8];
+     const char *cls;
+ };
+ static struct VpVoiceStat s_vstat[MCPX_HW_MAX_VOICES];
+ static int s_vstat_on = -1;
++static int s_vstat_pairs;           /* RECOMP_APU_VOICES=2: every bin:volume pair */
+ static int s_vdump_voice = -1;      /* -2: every voice, one file each */
+ static FILE *s_vdump;
+ static FILE *s_vdump_all[MCPX_HW_MAX_VOICES];
+@@ -774,7 +824,9 @@ static unsigned s_vstat_frames, s_vstat_secs;
  static void vp_stat_init(void)
  {
      const char *e;
 -    s_vstat_on = apu_env_on("RECOMP_APU_TRACE");
 +    s_vstat_on = apu_env_on("RECOMP_APU_TRACE") || apu_env_on("RECOMP_APU_VOICES");
++    e = getenv("RECOMP_APU_VOICES");
++    s_vstat_pairs = e && atoi(e) >= 2;
      e = getenv("RECOMP_APU_VOICE_DUMP");
      if (e && *e) {
          const char *path = getenv("RECOMP_APU_VOICE_DUMP_FILE");
+@@ -866,6 +918,12 @@ static void vp_stat_report(void)
+                 s->rate, s->ea, s->vol0, s->vol1, s->bin0, s->bin1, s->addr,
+                 s->cls ? s->cls : "?", s->frames,
+                 sqrt(s->sq / s->frames) * 32768.0, (double)s->zc / s->frames);
++        if (s_vstat_pairs)
++            fprintf(stderr, "[APU-VPAIRS] t=%us v=%u %u:%03X %u:%03X %u:%03X %u:%03X"
++                    " %u:%03X %u:%03X %u:%03X %u:%03X\n", s_vstat_secs, v,
++                    s->binx[0], s->volx[0], s->binx[1], s->volx[1], s->binx[2], s->volx[2],
++                    s->binx[3], s->volx[3], s->binx[4], s->volx[4], s->binx[5], s->volx[5],
++                    s->binx[6], s->volx[6], s->binx[7], s->volx[7]);
+         s->frames = 0; s->zc = 0; s->sq = 0;
+     }
+ }
+@@ -1537,6 +1595,10 @@ static void voice_process(MCPXAPUState *d,
+         s_vstat[v].rate = rate;
+         s_vstat[v].vol0 = vol[0]; s_vstat[v].vol1 = vol[1];
+         s_vstat[v].bin0 = (uint8_t)bin[0]; s_vstat[v].bin1 = (uint8_t)bin[1];
++        for (int i = 0; i < 8; i++) {
++            s_vstat[v].volx[i] = vol[i];
++            s_vstat[v].binx[i] = (uint8_t)bin[i];
++        }
+     }
+ 
+     if (voice_should_mute(v)) return;
+@@ -1690,6 +1752,18 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+ 
+             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
++                /* A blank voice ends the walk for this frame rather than
++                 * trapping: its idle trap would reach DSOUND's routine for a
++                 * voice with no buffer (a null slot it does not check; voice
++                 * 0 gets past its index test against the zeroed page 0 and
++                 * faults at 0xFFFFFFBE). RECOMP_APU_STALE_TRAP=0 walks on. */
++                if (apu_stale_trap_on() && voice_is_blank(d, v)) {
++                    static unsigned nb;
++                    if (nb++ < 8)
++                        fprintf(stderr, "[APU] list %d reached blank voice %u: walk ends this frame "
++                                "(%u so far)\n", list, v, nb);
++                    break;
++                }
+                 /* One trap at a time: once the front end is trapped, a second
+                  * idle voice in the same frame would overwrite FEDECPARAM
+                  * before the ISR has read the first. The rest trap on later
+@@ -1763,6 +1837,69 @@ void mcpx_apu_vp_finalize(MCPXAPUState *d)
+     s_ring_frames = s_ring_secs = 0;
+ }
+ 
++/* An idle-voice trap (SE2FE_IDLE_VOICE) that the guest's service routine has
++ * not taken yet, for a voice the title has since unlinked from every voice
++ * list or started again: retract it -- FE back to free running, FETINTSTS
++ * down -- and return 1. The caller re-derives the line.
++ *
++ * On the console the routine runs at DIRQL microseconds after the trap,
++ * ahead of any thread at DISPATCH_LEVEL. Here it waits for the gate holder's
++ * next safe point, which can be the end of a long DirectSound region at
++ * raised IRQL: PGR2's (XDK DSOUND) Stop finds the FE already trapped, so it
++ * does not halt it, unlinks the voice itself (sub_001F25D7, no notification)
++ * and the release then nulls the voice's slot (sub_001EFFD5). The late
++ * routine looked the slot up, got null, and read 0xFFFFFFBE in
++ * sub_001F25D7; a slot already reused would have had a playing voice
++ * "completed" instead. A blank voice (voice_is_blank) is retracted too:
++ * the walk reached it through a block mid-rewrite. Retracting leaves what the console's order leaves:
++ * the voice off the list, the FE running. RECOMP_APU_STALE_TRAP=0 delivers
++ * such traps as before. */
++int mcpx_apu_vp_retract_stale_idle_trap(MCPXAPUState *d)
++{
++    static unsigned n;
++    static int tl = -1;
++    uint32_t fectl = d->regs[NV_PAPU_FECTL];
++    uint16_t v, h, prev = 0xFFFF;
++    int list, i, linked = 0, blank;
++
++    if (tl < 0)
++        tl = apu_env_on("RECOMP_APU_TRAPLOG");
++    if (!apu_stale_trap_on() || !(d->regs[NV_PAPU_ISTS] & NV_PAPU_ISTS_FETINTSTS) ||
++        (fectl & NV_PAPU_FECTL_FEMETHMODE) != NV_PAPU_FECTL_FEMETHMODE_TRAPPED ||
++        (fectl & NV_PAPU_FECTL_FETRAPREASON) != NV_PAPU_FECTL_FETRAPREASON_REQUESTED ||
++        d->regs[NV_PAPU_FEDECMETH] != SE2FE_IDLE_VOICE)
++        return 0;
++    v = (uint16_t)d->regs[NV_PAPU_FEDECPARAM];
++    for (list = 0; list < 3 && !linked; list++) {
++        h = (uint16_t)d->regs[voice_list_regs[list].top];
++        prev = 0xFFFF;
++        for (i = 0; h != 0xFFFF && i < MCPX_HW_MAX_VOICES; i++) {
++            if (h == v) { linked = 1; break; }
++            prev = h;
++            h = (uint16_t)voice_get_mask(d, h, NV_PAVS_VOICE_TAR_PITCH_LINK,
++                                         NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
++        }
++    }
++    blank = voice_is_blank(d, v);
++    if (linked && !blank && !voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
++                                            NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
++        /* RECOMP_APU_TRAPLOG=1: every idle trap that goes to the routine
++         * (and every retraction below). */
++        if (tl)
++            fprintf(stderr, "[APU] idle trap to the routine: voice %u in list %d after %u, next %u\n", v,
++                    list - 1, prev,
++                    (unsigned)voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
++                                             NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE));
++        return 0;
++    }
++    d->regs[NV_PAPU_FECTL] &= ~(NV_PAPU_FECTL_FEMETHMODE | NV_PAPU_FECTL_FETRAPREASON);
++    qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_FETINTSTS);
++    if (n++ < 8 || tl)
++        fprintf(stderr, "[APU] stale idle-voice trap retracted: voice %u %s (%u so far)\n",
++                v, blank ? "blank" : linked ? "playing again" : "no longer in a list", n);
++    return 1;
++}
++
+ void mcpx_apu_vp_reset(MCPXAPUState *d)
+ {
+     d->vp.ssl_base_page = 0;
 diff --git a/src/kernel/kernel.h b/src/kernel/kernel.h
-index 4a6389d..bb81eb5 100644
+index 4a6389d..05fa71e 100644
 --- a/src/kernel/kernel.h
 +++ b/src/kernel/kernel.h
 @@ -541,6 +541,10 @@ void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count);
@@ -55,11 +345,45 @@ index 4a6389d..bb81eb5 100644
  /*
   * Character type of a translated host path. The Win32 file APIs take wide
   * chars; POSIX takes bytes. kernel_path.c and kernel_file.c are split on
+@@ -843,6 +847,10 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObject(HANDLE Handle, BOOLEAN Alertable,
+ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(HANDLE Handle, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
+ NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(ULONG Count, HANDLE Handles[], ULONG WaitType, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
+ NTSTATUS __stdcall xbox_NtSuspendThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount);
++/* Guest locks (critical sections, the DISPATCH gate) the calling thread holds or is
++ * acquiring; xbox_SuspendGuestThread waits for the target to be outside them. */
++void xbox_ThreadLockDepthAdd(long d);
++DWORD xbox_SuspendGuestThread(HANDLE h);
+ NTSTATUS __stdcall xbox_NtResumeThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount);
+ NTSTATUS __stdcall xbox_NtClearEvent(HANDLE EventHandle);
+ NTSTATUS __stdcall xbox_NtCreateMutant(PHANDLE MutantHandle, PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, BOOLEAN InitialOwner);
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index 10d00f4..e33fa7b 100644
+index 10d00f4..755983c 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
-@@ -4915,6 +4915,26 @@ static void bridge_NtSetInformationFile(void)
+@@ -461,7 +461,8 @@ static RECOMP_TLS uint32_t g_thread_stack_top = 0;
+  * Per thread, because an APC belongs to the thread that issued the request and
+  * runs only when that thread waits alertably. 16 is generous: a title waits
+  * between batches of reads, and an overflowing request is delivered inline
+- * (the old behaviour) rather than dropped. */
++ * (the old behaviour) rather than dropped. Inline is the ordering deferral
++ * exists to avoid, so an overflow is logged. */
+ static int g_defer_io_apc = 0;
+ #define IO_APC_QUEUE 16
+ static RECOMP_TLS uint32_t g_io_apc[IO_APC_QUEUE][3];   /* routine, ctx, iosb */
+@@ -4488,6 +4489,12 @@ static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
+             uint32_t *q = g_io_apc[g_io_apc_count++];
+             q[0] = apc_routine; q[1] = apc_context; q[2] = iostatus;
+         } else {
++            if (g_defer_io_apc) {
++                static volatile LONG nover;
++                if (InterlockedIncrement(&nover) <= 20)
++                    fprintf(stderr, "  [KERNEL] deferred I/O APC queue full (%d): APC 0x%08X"
++                            " delivered inline\n", IO_APC_QUEUE, apc_routine);
++            }
+             deliver_one_apc(apc_routine, apc_context, iostatus);
+         }
+     }
+@@ -4915,6 +4922,26 @@ static void bridge_NtSetInformationFile(void)
      bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
  }
  
@@ -86,7 +410,7 @@ index 10d00f4..e33fa7b 100644
  /* ── NtQueryVolumeInformationFile (ordinal 218, 5 args = 20 bytes) */
  static void bridge_NtQueryVolumeInformationFile(void)
  {
-@@ -4934,6 +4954,37 @@ static void bridge_NtQueryVolumeInformationFile(void)
+@@ -4934,6 +4961,37 @@ static void bridge_NtQueryVolumeInformationFile(void)
      g_eax = (uint32_t)xbox_NtQueryVolumeInformationFile(handle, &ios,
                  XBOX_TO_NATIVE(info_va), length,
                  (XBOX_FS_INFORMATION_CLASS)infoclass);
@@ -124,7 +448,7 @@ index 10d00f4..e33fa7b 100644
      bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
  }
  
-@@ -5004,15 +5055,58 @@ static void bridge_NtQueryDirectoryFile(void)
+@@ -5004,15 +5062,58 @@ static void bridge_NtQueryDirectoryFile(void)
      g_eax = (uint32_t)xbox_NtQueryDirectoryFile(handle, NULL, NULL, NULL, &ios,
                  XBOX_TO_NATIVE(info_va), length, (XBOX_FILE_INFORMATION_CLASS)info_class,
                  pfn, (BOOLEAN)restart);
@@ -185,7 +509,7 @@ index 10d00f4..e33fa7b 100644
      if (handle_va) BRIDGE_MEM32(handle_va) = 0xDEAD0001u;
      g_eax = STATUS_SUCCESS;
  }
-@@ -5023,7 +5117,7 @@ static void bridge_NtQuerySymbolicLinkObject(void)
+@@ -5023,7 +5124,7 @@ static void bridge_NtQuerySymbolicLinkObject(void)
      /* uint32_t handle = STACK_ARG(0); */
      uint32_t target_va = STACK_ARG(1);
      uint32_t retlen_va = STACK_ARG(2);
@@ -194,7 +518,7 @@ index 10d00f4..e33fa7b 100644
      USHORT len = (USHORT)strlen(target);
  
      if (retlen_va) BRIDGE_MEM32(retlen_va) = (uint32_t)len;
-@@ -5252,6 +5346,14 @@ static void bridge_NtFsControlFile(void)
+@@ -5252,6 +5353,14 @@ static void bridge_NtFsControlFile(void)
      uint32_t fsctl = STACK_ARG(5);
      uint32_t ios_va = STACK_ARG(4);
      fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
@@ -209,6 +533,51 @@ index 10d00f4..e33fa7b 100644
      bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
      g_eax = 0xC00000BBu;
  }
+@@ -8543,7 +8652,7 @@ static void bridge_KeSuspendThread(void)
+         hThread = XBOX_TO_NATIVE(STACK_ARG(0));
+ 
+     if (hThread)
+-        g_eax = (uint32_t)SuspendThread(hThread);
++        g_eax = (uint32_t)xbox_SuspendGuestThread(hThread);
+     else
+         g_eax = 0;
+ }
+@@ -10827,6 +10936,35 @@ static void kernel_thunk_dispatch_body(void)
+     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
+         g_ordinal_calls[ordinal]++;
+ 
++    {
++        /* One ordinal called millions of times in a row by one thread, and
++         * nothing else: a guest busy loop (PGR2 froze at the end of a race
++         * in one calling KeQuerySystemTime 5 million times a second, with
++         * no way to tell afterwards which loop). Once per thread, the guest
++         * return addresses on its stack, innermost first. */
++        static RECOMP_TLS uint32_t spin_ord, spin_n;
++        static RECOMP_TLS int spin_told;
++        if (ordinal != spin_ord) {
++            spin_ord = ordinal;
++            spin_n = 0;
++        } else if (++spin_n == 20000000u && !spin_told) {
++            uint32_t a, n = 0, s = g_esp;
++            spin_told = 1;
++            fprintf(stderr, "  [KERNEL] thread %lu: ordinal %u called %u times in a row, esp=0x%08X;"
++                    " image addresses on its stack:", (unsigned long)GetCurrentThreadId(),
++                    ordinal, spin_n, s);
++            for (a = s; a < s + 0x1000 && n < 40; a += 4) {
++                uint32_t v = BRIDGE_MEM32(a);
++                if (v >= 0x00011000u && v < g_xbox_image_hi) {
++                    fprintf(stderr, " %08X@+%X", v, a - s);
++                    n++;
++                }
++            }
++            fprintf(stderr, "\n");
++            fflush(stderr);
++        }
++    }
++
+     if (KERNEL_LOG_ON()) {
+         /* The guest return address sits at the top of the guest stack: the
+          * caller pushed it before dispatching here. Logging it turns "some
 diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
 index eb33a61..7ec2611 100644
 --- a/src/kernel/kernel_file.c
@@ -242,6 +611,39 @@ index eb33a61..7ec2611 100644
              WCHAR pattern_wide[MAX_PATH];
              MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
                                  pattern_wide, MAX_PATH);
+diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
+index 45d548c..3eae761 100644
+--- a/src/kernel/kernel_hal.c
++++ b/src/kernel/kernel_hal.c
+@@ -252,8 +252,11 @@ static void gate_entered(void)
+ static int gate_try(void)
+ {
+     dispatch_gate_once();
+-    if (!TryEnterCriticalSection(&s_dispatch_gate))
++    xbox_ThreadLockDepthAdd(1);
++    if (!TryEnterCriticalSection(&s_dispatch_gate)) {
++        xbox_ThreadLockDepthAdd(-1);
+         return 0;
++    }
+     gate_entered();
+     return 1;
+ }
+@@ -261,6 +264,7 @@ static int gate_try(void)
+ static void gate_enter(void)
+ {
+     dispatch_gate_once();
++    xbox_ThreadLockDepthAdd(1);         /* see xbox_SuspendGuestThread */
+     EnterCriticalSection(&s_dispatch_gate);
+     gate_entered();
+ }
+@@ -270,6 +274,7 @@ static void gate_leave_raw(void)
+     if (--t_gate_depth == 0)
+         InterlockedExchange(&s_gate_owner, 0);
+     LeaveCriticalSection(&s_dispatch_gate);
++    xbox_ThreadLockDepthAdd(-1);
+ }
+ 
+ unsigned long xbox_DispatchGateOwner(void)
 diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
 index 2f1edbb..479db4c 100644
 --- a/src/kernel/kernel_path.c
@@ -343,8 +745,161 @@ index 2f1edbb..479db4c 100644
 +}
 +
  #endif /* _WIN32 */
+diff --git a/src/kernel/kernel_rtl.c b/src/kernel/kernel_rtl.c
+index 28066a7..ae66ede 100644
+--- a/src/kernel/kernel_rtl.c
++++ b/src/kernel/kernel_rtl.c
+@@ -477,6 +477,7 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
+         return;
+     InterlockedIncrement(&g_cs_enters);
+     crt_lock_trace("take", CriticalSection);
++    xbox_ThreadLockDepthAdd(1);         /* acquiring counts: see xbox_SuspendGuestThread */
+     if (TryEnterCriticalSection(cs)) {
+         xbox_cs_note_owner(cs);
+         return;
+@@ -532,6 +533,7 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
+         crt_lock_trace("drop", CriticalSection);
+         xbox_cs_clear_owner(cs);
+         LeaveCriticalSection(cs);
++        xbox_ThreadLockDepthAdd(-1);
+     }
+ }
+ 
+diff --git a/src/kernel/kernel_thread.c b/src/kernel/kernel_thread.c
+index 9afbbe3..d1b5434 100644
+--- a/src/kernel/kernel_thread.c
++++ b/src/kernel/kernel_thread.c
+@@ -350,6 +350,119 @@ NTSTATUS __stdcall xbox_NtDuplicateObject(
+     return STATUS_SUCCESS;
+ }
+ 
++/* ============================================================================
++ * Suspending a thread that is inside a guest lock
++ *
++ * A guest NtSuspendThread lands wherever the target is. On the console that
++ * is nearly always a sleep: the caller has the one CPU, and a thread is
++ * preempted inside a short locked region only rarely. Here the target runs
++ * beside the caller and can be anywhere, including inside
++ * RtlEnterCriticalSection. Windows' critical section wakes one waiter when the
++ * lock is released and wakes no other until that one has retried; suspended,
++ * it never does, and the lock -- free -- is never taken again. PGR2 (NOTES 17)
++ * suspends its audio meter thread at the end of a race, and that thread polls
++ * DirectSound every 2 ms: caught waiting on DirectSound's lock, it froze the
++ * main thread's teardown on the same lock, every few race ends.
++ *
++ * So each thread counts the guest locks it holds or is acquiring (critical
++ * sections, the DISPATCH gate), and xbox_SuspendGuestThread suspends a
++ * target only at a moment that count is zero: suspend, look, and if it is
++ * inside one, resume, yield and look again -- for up to
++ * RECOMP_SAFE_SUSPEND_MS (default 500), then suspend it where it is.
++ * RECOMP_SAFE_SUSPEND=0 suspends at once, as before. POSIX has no
++ * asynchronous suspend (SuspendThread only counts there), so this is
++ * Windows-only.
++ * ============================================================================ */
++
++#define XBOX_BUSY_SLOTS 1024
++
++static struct {
++    volatile LONG tid;
++    volatile LONG busy;
++} s_busy[XBOX_BUSY_SLOTS];
++static XBOX_THREAD_LOCAL volatile LONG *t_busy;
++
++static volatile LONG *busy_slot(DWORD tid, int create)
++{
++    unsigned i, h = (unsigned)tid * 2654435761u % XBOX_BUSY_SLOTS;
++
++    for (i = 0; i < XBOX_BUSY_SLOTS; i++) {
++        unsigned k = (h + i) % XBOX_BUSY_SLOTS;
++        LONG t = s_busy[k].tid;
++        if (t == (LONG)tid)
++            return &s_busy[k].busy;
++        if (t == 0) {
++            if (!create)
++                return NULL;
++            if (InterlockedCompareExchange(&s_busy[k].tid, (LONG)tid, 0) == 0) {
++                s_busy[k].busy = 0;
++                return &s_busy[k].busy;
++            }
++            if (s_busy[k].tid == (LONG)tid)
++                return &s_busy[k].busy;
++        }
++    }
++    return NULL;
++}
++
++void xbox_ThreadLockDepthAdd(long d)
++{
++    if (!t_busy)
++        t_busy = busy_slot(GetCurrentThreadId(), 1);
++    if (t_busy)
++        InterlockedExchangeAdd(t_busy, d);
++}
++
++DWORD xbox_SuspendGuestThread(HANDLE h)
++{
++#ifdef _WIN32
++    static int on = -1;
++    static DWORD limit_ms;
++    static volatile LONG deferred, forced, clear;
++    DWORD tid = GetThreadId(h), prev, t0;
++    volatile LONG *busy;
++    int tries = 0;
++
++    if (on < 0) {
++        const char *e = getenv("RECOMP_SAFE_SUSPEND");
++        const char *m = getenv("RECOMP_SAFE_SUSPEND_MS");
++        limit_ms = (m && *m) ? (DWORD)strtoul(m, NULL, 0) : 500;
++        on = !(e && *e == '0');
++    }
++    if (!on || !tid || tid == GetCurrentThreadId() || !(busy = busy_slot(tid, 0)))
++        return SuspendThread(h);
++    t0 = GetTickCount();
++    for (;;) {
++        CONTEXT ctx;
++        prev = SuspendThread(h);
++        if (prev == (DWORD)-1 || prev > 0)
++            return prev;                /* failed, or already suspended */
++        /* SuspendThread is asynchronous; this returns once it has stopped. */
++        ctx.ContextFlags = CONTEXT_CONTROL;
++        GetThreadContext(h, &ctx);
++        if (*busy <= 0)
++            break;
++        if (GetTickCount() - t0 >= limit_ms) {
++            if (InterlockedIncrement(&forced) <= 8)
++                fprintf(stderr, "  [THREAD] NtSuspendThread: thread %lu still inside a guest lock after "
++                        "%lu ms (%d tries); suspended there\n", tid, limit_ms, tries);
++            return prev;
++        }
++        ResumeThread(h);
++        tries++;
++        Sleep(tries < 4 ? 0 : 1);
++    }
++    if (tries && InterlockedIncrement(&deferred) <= 8)
++        fprintf(stderr, "  [THREAD] NtSuspendThread: thread %lu was inside a guest lock; suspended "
++                "after it left (%d tries, %lu ms)\n", tid, tries, GetTickCount() - t0);
++    else if (!tries && InterlockedIncrement(&clear) <= 4)
++        fprintf(stderr, "  [THREAD] NtSuspendThread: thread %lu suspended outside any guest lock\n", tid);
++    return prev;
++#else
++    return SuspendThread(h);
++#endif
++}
++
+ NTSTATUS __stdcall xbox_NtSuspendThread(
+     HANDLE ThreadHandle,
+     PULONG PreviousSuspendCount)
+@@ -362,7 +475,7 @@ NTSTATUS __stdcall xbox_NtSuspendThread(
+      * the two are not interchangeable: -1 must become an error status rather
+      * than a suspend count of 0xFFFFFFFF.
+      */
+-    prev = SuspendThread(ThreadHandle);
++    prev = xbox_SuspendGuestThread(ThreadHandle);
+     if (prev == (DWORD)-1) {
+         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
+             "NtSuspendThread: SuspendThread failed (error %u)", GetLastError());
 diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
-index 327f01d..73083b2 100644
+index 327f01d..a71e7c7 100644
 --- a/src/kernel/nv2a_backend.h
 +++ b/src/kernel/nv2a_backend.h
 @@ -28,6 +28,7 @@
@@ -367,7 +922,7 @@ index 327f01d..73083b2 100644
      uint32_t pitch;             /* bytes per row */
      uint32_t bytes_per_pixel;   /* 2 or 4 */
      uint32_t aa_sx, aa_sy;      /* 1 or 2 each */
-@@ -51,6 +57,10 @@ typedef struct {
+@@ -51,6 +57,13 @@ typedef struct {
       * a linear texture) and the raw SET_TEXTURE_FILTER word (MIN in bits
       * 16-23). A back end that ignores them samples level 0. */
      uint32_t levels, filter;
@@ -375,10 +930,13 @@ index 327f01d..73083b2 100644
 +     * palettised format 0x0B, else 0. RalliSport Challenge 2 keeps its car glass
 +     * mask in one; a back end that hashes texels should hash these 1 KB too. */
 +    uint32_t palette;
++    /* addr 4 (border): SET_TEXTURE_BORDER_COLOR (A8R8G8B8) and whether FORMAT's
++     * border source selects it (else the border comes from the texture). */
++    uint32_t border, border_color;
  } Nv2aTexture;
  
  typedef struct {
-@@ -80,6 +90,16 @@ typedef struct {
+@@ -80,6 +93,16 @@ typedef struct {
       * that ignores these draws that pass over the whole surface. */
      uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
      uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
@@ -395,7 +953,7 @@ index 327f01d..73083b2 100644
  } Nv2aRenderState;
  
  typedef struct {
-@@ -89,6 +109,78 @@ typedef struct {
+@@ -89,6 +112,78 @@ typedef struct {
      const Nv2aRenderState *state;
  } Nv2aBatch;
  
@@ -474,7 +1032,7 @@ index 327f01d..73083b2 100644
  typedef struct {
      /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
       * zstencil: SET_ZSTENCIL_CLEAR_VALUE (depth in the top 24 bits for Z24S8). */
-@@ -96,17 +188,60 @@ typedef struct {
+@@ -96,17 +191,60 @@ typedef struct {
                    uint32_t flags, uint32_t argb, uint32_t zstencil);
      void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
      void (*flip)(void);
@@ -535,7 +1093,7 @@ index 327f01d..73083b2 100644
  /* Where BACK_END_WRITE_SEMAPHORE_RELEASE (0x1D70) values land: the guest VA
   * of the semaphore the title reads GPU progress from (for XDK D3D, the
   * pointer at device+0x30). The executor writes each release there once it
-@@ -117,4 +252,8 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+@@ -117,4 +255,8 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
   * the semaphore context DMA object through RAMIN. */
  void nv2a_pb_set_semaphore_target(uint32_t guest_va);
  
@@ -545,7 +1103,7 @@ index 327f01d..73083b2 100644
 +
  #endif /* NV2A_BACKEND_H */
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index a513bc7..781e9de 100644
+index a513bc7..b279d6b 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -305,6 +305,10 @@ static struct {
@@ -577,7 +1135,16 @@ index a513bc7..781e9de 100644
      uint32_t alpha_test, alpha_func, alpha_ref;
      uint32_t fog_enable, fog_mode, fog_color;
      float    fog_param[2];
-@@ -619,9 +627,22 @@ static uint32_t surface_bpp(void);
+@@ -510,6 +518,8 @@ static void note_unhandled(uint32_t method, uint32_t param)
+         s_unhandled[*slot - 1].last_param = param;
+         return;
+     }
++    if (method >= 0x1500 && method < 0x1800)    /* immediate-mode vertex methods: say which */
++        fprintf(stderr, "  [GPU] unhandled vertex method 0x%04X = 0x%08X\n", method, param);
+     if (s_unhandled_count < PB_EXEC_MAX_UNHANDLED) {
+         s_unhandled[s_unhandled_count].method = method;
+         s_unhandled[s_unhandled_count].count = 1;
+@@ -619,9 +629,22 @@ static uint32_t surface_bpp(void);
  
  static void note_drawn(void)
  {
@@ -603,7 +1170,7 @@ index a513bc7..781e9de 100644
      s_gpu.drawn_stale = 0;
      s_gpu.drawn_offset = s_gpu.color_offset;
      s_gpu.drawn_pitch = s_gpu.pitch;
-@@ -774,12 +795,29 @@ static void surface_apply_clip(void)
+@@ -774,12 +797,29 @@ static void surface_apply_clip(void)
  /* ---- Render back end (nv2a_backend.h) ------------------------------- */
  
  static const Nv2aBackend *s_backend;
@@ -633,7 +1200,7 @@ index a513bc7..781e9de 100644
  static int backend_draws(void)
  {
      return s_backend && s_backend->draw;
-@@ -790,6 +828,8 @@ static void current_surface(Nv2aSurface *out)
+@@ -790,6 +830,8 @@ static void current_surface(Nv2aSurface *out)
      out->color_va        = dma_resolve(s_gpu.color_offset);
      out->width           = s_gpu.clip_w;
      out->height          = s_gpu.clip_h;
@@ -642,7 +1209,7 @@ index a513bc7..781e9de 100644
      out->pitch           = s_gpu.pitch;
      out->bytes_per_pixel = surface_bpp();
      out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
-@@ -827,6 +867,9 @@ static void current_render_state(Nv2aRenderState *r)
+@@ -827,6 +869,9 @@ static void current_render_state(Nv2aRenderState *r)
      r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
      r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
      r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
@@ -652,7 +1219,7 @@ index a513bc7..781e9de 100644
  }
  
  static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
-@@ -844,7 +887,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+@@ -844,7 +889,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
      s_gpu.texs[0].color  = tex->color;
      s_gpu.texs[0].addr_u = 3;
      s_gpu.texs[0].addr_v = 3;
@@ -661,7 +1228,23 @@ index a513bc7..781e9de 100644
      s_gpu.texs[0].levels = 1;
      s_gpu.texs[0].filter = 0;
      s_gpu.texs[0].cube   = 0;
-@@ -1135,6 +1178,7 @@ static uint32_t linear_twin(uint32_t fmt)
+@@ -896,7 +941,14 @@ static void clear_surface(uint32_t param)
+         Nv2aSurface surf;
+         Nv2aRenderState rs;
+ 
+-        if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
++        /* A depth-only pass (shadow map) has colour offset 0 and colour writes
++         * off; its depth/stencil clear still counts. PGR2's 1024x1024 shadow
++         * buffer was never cleared, so casters piled up frame after frame
++         * (RECOMP_ZONLY_CLEAR=0 drops such clears as before). */
++        static int zonly = -1;
++        if (zonly < 0) { const char *e = getenv("RECOMP_ZONLY_CLEAR"); zonly = !(e && e[0] == '0'); }
++        if (!(zonly && !s_gpu.color_offset && (param & 3) && s_gpu.zeta_offset && s_gpu.clip_h) &&
++            (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0))
+             return;
+         current_surface(&surf);
+         current_render_state(&rs);
+@@ -1135,6 +1187,7 @@ static uint32_t linear_twin(uint32_t fmt)
      case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
      case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
      case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
@@ -669,7 +1252,7 @@ index a513bc7..781e9de 100644
      default:   return fmt;                 /* already linear, or unhandled */
      }
  }
-@@ -1287,9 +1331,15 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+@@ -1287,9 +1340,15 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
          *argb = 0xFF000000u | (t << 16) | (t << 8) | t;
          return 1;
      }
@@ -686,7 +1269,7 @@ index a513bc7..781e9de 100644
  
      /* 4:2:2 packed YUV, two texels per four bytes.
       *
-@@ -1995,6 +2045,7 @@ static int s_xf_no_tex;
+@@ -1995,6 +2054,7 @@ static int s_xf_no_tex;
   * dropped. */
  #define NV_BACKEND_MAX_VERTS (NV_MAX_INDICES * 3)
  static Nv2aVertex *s_bverts;     /* about 5.5 MB: allocated by the first vertex */
@@ -694,7 +1277,7 @@ index a513bc7..781e9de 100644
  static uint32_t   s_bcount;
  
  static Nv2aVertex *backend_slot(void)
-@@ -2002,12 +2053,24 @@ static Nv2aVertex *backend_slot(void)
+@@ -2002,12 +2062,24 @@ static Nv2aVertex *backend_slot(void)
      if (!s_bverts
          && !(s_bverts = (Nv2aVertex *)calloc(NV_BACKEND_MAX_VERTS, sizeof *s_bverts)))
          return NULL;
@@ -720,7 +1303,7 @@ index a513bc7..781e9de 100644
  {
      float su = 1.0f, sv = 1.0f;
  
-@@ -2022,23 +2085,33 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+@@ -2022,23 +2094,33 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
      o->diffuse = pack_color(v->d0);
      o->u = v->tex[0][0] * su;
      o->v = v->tex[0][1] * sv;
@@ -757,7 +1340,7 @@ index a513bc7..781e9de 100644
      batch.texture = NULL;
      batch.state = &rs;
      if (textured && s_gpu.texs[0].valid) {
-@@ -2051,10 +2124,52 @@ static void backend_flush(int textured)
+@@ -2051,10 +2133,54 @@ static void backend_flush(int textured)
          tex.addr_v = s_gpu.texs[0].addr_v;
          tex.levels = s_gpu.texs[0].pitch ? 1 : s_gpu.texs[0].levels;
          tex.filter = s_gpu.texs[0].filter;
@@ -803,6 +1386,8 @@ index a513bc7..781e9de 100644
 +            si->tex.levels = t->pitch ? 1 : t->levels;
 +            si->tex.filter = t->filter;
 +            si->tex.palette = t->palette;
++            si->tex.border = t->border;
++            si->tex.border_color = (uint32_t)t->border_color;
 +        }
 +        s_backend->draw_ext(&surf, &batch, &x);
 +    } else if (!vsh) {
@@ -812,7 +1397,7 @@ index a513bc7..781e9de 100644
      s_bcount = 0;
      note_drawn();
  }
-@@ -2097,6 +2212,25 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+@@ -2097,6 +2223,25 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
              o[k].diffuse = vertex_color(ix[k]);
              o[k].u = textured ? uv[k][0] : 0.0f;
              o[k].v = textured ? uv[k][1] : 0.0f;
@@ -838,7 +1423,7 @@ index a513bc7..781e9de 100644
          }
          s_bcount += 3;
          return;
-@@ -2208,7 +2342,7 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
+@@ -2208,7 +2353,7 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
      case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
          return 1;
      case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11:
@@ -847,7 +1432,7 @@ index a513bc7..781e9de 100644
          return 2;
      default:
          return 4;
-@@ -2233,6 +2367,23 @@ static uint32_t tex_face_stride(const Texture *t)
+@@ -2233,6 +2378,23 @@ static uint32_t tex_face_stride(const Texture *t)
      return (total + 127u) & ~127u;
  }
  
@@ -871,7 +1456,7 @@ index a513bc7..781e9de 100644
  /* One texel at normalised (swizzled/DXT) or texel (linear) coordinates, as
   * floats. An unusable stage reads white, so a missing texture multiplies
   * through instead of blacking the pixel out. */
-@@ -2609,6 +2760,155 @@ static XfTri s_xfq_tris[XF_QUEUE_MAX];
+@@ -2609,6 +2771,155 @@ static XfTri s_xfq_tris[XF_QUEUE_MAX];
  static int s_xfq_n;
  static long s_xfq_px;
  
@@ -1027,7 +1612,7 @@ index a513bc7..781e9de 100644
  static void xf_queue_flush(void)
  {
      XfCount cnt = {0, 0, 0};
-@@ -2682,9 +2982,10 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2682,9 +2993,10 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      if (backend_draws()) {                     /* a back end rasterises */
          Nv2aVertex *o = backend_slot();
          if (o) {
@@ -1041,7 +1626,7 @@ index a513bc7..781e9de 100644
              s_bcount += 3;
          }
          return;
-@@ -2927,15 +3228,528 @@ static void xf_set_viewport(void)
+@@ -2927,15 +3239,552 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -1139,6 +1724,30 @@ index a513bc7..781e9de 100644
 +    if (!prog)
 +        return 0;
 +    hash = nv2a_vsh_program_hash();
++    {
++        /* RECOMP_PB_ATTRDUMP=<vsh hash>: each attribute's format and the first
++         * vertex's raw dwords, for the first 12 draws of that programme. */
++        static int on = -1, n; static uint32_t want;
++        if (on < 0) { const char *e = getenv("RECOMP_PB_ATTRDUMP"); on = e != NULL; if (e) want = (uint32_t)strtoul(e, NULL, 16); }
++        if (on && hash == want && n < 60) {
++            n++;
++            fprintf(stderr, "[ATTR] vsh %08X inline %d count %u idx %u fog en %u mode %X gen %X surf %08X fmt %08X\n",
++                    hash, s_gpu.inline_active, s_gpu.inline_count, s_gpu.idx_count, s_gpu.fog_enable,
++                    s_gpu.fog_mode, s_reg[0x02A0 / 4], dma_resolve(s_gpu.color_offset), s_gpu.format);
++            for (a = 0; a < NV_VERTEX_ATTRS; a++) {
++                const VertexAttr *at = &s_gpu.attr[a];
++                if (at->size)
++                    fprintf(stderr, "  a%u type %u size %u stride %u offset %08X\n", a, at->type, at->size,
++                            at->stride, at->offset);
++            }
++            if (s_gpu.inline_active) {
++                fprintf(stderr, "  dwords:");
++                for (k = 0; k < s_gpu.inline_count && k < 24; k++)
++                    fprintf(stderr, " %08X", s_gpu.inline_buf[k]);
++                fprintf(stderr, "\n");
++            }
++        }
++    }
 +    if (!s_backend->vsh_gpu(prog, len, hash))
 +        return 0;
 +    if (!s_gv_attrs) {
@@ -1570,7 +2179,7 @@ index a513bc7..781e9de 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -2993,11 +3807,32 @@ static void raster_batch_program(void)
+@@ -2993,11 +3842,32 @@ static void raster_batch_program(void)
          }
          /* Spread out: one every 20000 program batches, so a run that spends
           * its first half in menus still traces the 3D scene. */
@@ -1606,7 +2215,7 @@ index a513bc7..781e9de 100644
              for (i = 0; i < NV_VERTEX_ATTRS; i++) {
                  const VertexAttr *at = &s_gpu.attr[i];
                  if (!at->size)
-@@ -3008,13 +3843,85 @@ static void raster_batch_program(void)
+@@ -3008,13 +3878,85 @@ static void raster_batch_program(void)
                          at->size, at->stride, in[0], in[1], in[2], in[3]);
              }
              {
@@ -1694,7 +2303,7 @@ index a513bc7..781e9de 100644
              for (i = 0; i < 3; i++)
                  fprintf(stderr, "[VTRACE]   out%u pos %g %g %g %g\n", i,
                          s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
-@@ -3040,8 +3947,14 @@ static void raster_batch_program(void)
+@@ -3040,8 +3982,14 @@ static void raster_batch_program(void)
              raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
          break;
      case NV_PRIM_TRIANGLE_STRIP:
@@ -1711,7 +2320,7 @@ index a513bc7..781e9de 100644
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -3065,8 +3978,10 @@ static void raster_batch_program(void)
+@@ -3065,8 +4013,10 @@ static void raster_batch_program(void)
      }
      /* The batch's triangles, all at once (see xf_queue_push). */
      xf_queue_flush();
@@ -1722,7 +2331,7 @@ index a513bc7..781e9de 100644
  }
  
  static void raster_batch(void)
-@@ -3108,9 +4023,14 @@ static void raster_batch(void)
+@@ -3108,9 +4058,14 @@ static void raster_batch(void)
                             vertex_color(s_gpu.idx[i]));
          break;
      case NV_PRIM_TRIANGLE_STRIP:
@@ -1740,7 +2349,7 @@ index a513bc7..781e9de 100644
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -3212,8 +4132,14 @@ static void draw_primitive(void)
+@@ -3212,8 +4167,14 @@ static void draw_primitive(void)
      if (!s_gpu.prim || !s_gpu.idx_count)
          return;
      s_gpu.draws++;
@@ -1757,7 +2366,7 @@ index a513bc7..781e9de 100644
      s_gpu.verts += s_gpu.idx_count;
  
      /* How many batches carry coordinates at all, and what range they span.
-@@ -3402,6 +4328,9 @@ static void draw_inline_array(void)
+@@ -3402,6 +4363,9 @@ static void draw_inline_array(void)
          case 0:  bytes = 4;                        break;  /* D3DCOLOR   */
          case 2:  bytes = 4 * s_gpu.attr[a].size;   break;  /* float      */
          case 4:  bytes = s_gpu.attr[a].size;       break;  /* ubyte norm */
@@ -1767,7 +2376,50 @@ index a513bc7..781e9de 100644
          default: bytes = 4 * s_gpu.attr[a].size;   break;
          }
          s_gpu.attr[a].offset = off;
-@@ -3912,9 +4841,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3445,6 +4409,10 @@ out:
+  * carries and what this rasteriser samples; a second texcoord set or a normal
+  * would need the D3D11 translator, not more slots here.
+  */
++/* RECOMP_PB_ATTRDUMP: the immediate-mode methods of the batch being built. */
++static uint32_t s_imm_log[48][2];
++static int s_imm_log_n;
++
+ static void draw_immediate(void)
+ {
+     VertexAttr saved[NV_VERTEX_ATTRS];
+@@ -3473,6 +4441,19 @@ static void draw_immediate(void)
+ 
+     /* fetch_attr bounds-checks against inline_count dwords. */
+     s_gpu.inline_count = s_gpu.imm_count * IMM_VERTEX_DWORDS;
++    {
++        static int on = -1, shown; static uint32_t want;
++        if (on < 0) { const char *e = getenv("RECOMP_PB_ATTRDUMP"); on = e != NULL; if (e) want = (uint32_t)strtoul(e, NULL, 16); }
++        if (on && shown < 60 && (s_gpu.xf_mode & 3) == 2 && nv2a_vsh_program_hash() == want) {
++            int k;
++            shown++;
++            fprintf(stderr, "[IMM] %d methods:", s_imm_log_n);
++            for (k = 0; k < s_imm_log_n; k++)
++                fprintf(stderr, " %04X=%08X", s_imm_log[k][0], s_imm_log[k][1]);
++            fprintf(stderr, "\n");
++        }
++    }
++    s_imm_log_n = 0;
+     s_gpu.inline_active = 1;
+     draw_primitive();
+     s_gpu.inline_active = 0;
+@@ -3511,6 +4492,11 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
+     uint32_t attr, c;
+     float *a;
+     v.u = param;
++    if (method >= 0x1500 && method < 0x1B00 && s_imm_log_n < 48) {
++        s_imm_log[s_imm_log_n][0] = method;
++        s_imm_log[s_imm_log_n][1] = param;
++        s_imm_log_n++;
++    }
+ 
+     if (method >= NV097_SET_VERTEX4F && method < NV097_SET_VERTEX4F + 16) {
+         c = (method - NV097_SET_VERTEX4F) / 4;
+@@ -3912,9 +4898,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          s_gpu.rc_seen = 1;
          break;
      case 0x1E70: s_gpu.rc.stage_program = param; break;
@@ -1780,7 +2432,7 @@ index a513bc7..781e9de 100644
      case 0x0300: s_gpu.alpha_test = param; break;
      case 0x033C: s_gpu.alpha_func = param; break;
      case 0x0340: s_gpu.alpha_ref = param; break;
-@@ -3924,9 +4856,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3924,9 +4913,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
      case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
      case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
@@ -1800,7 +2452,7 @@ index a513bc7..781e9de 100644
          s_gpu.zpass_enable = param;
          break;
      case 0x17D0: {                                /* GET_REPORT */
-@@ -3937,12 +4879,25 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3937,12 +4936,25 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
           * 3 culls its world with these, so the race's main view drew only
           * the sky while the cube-map passes, which do not test, drew it all.
           * The report DMA object starts at physical 0 here, as D3D sets it. */
@@ -1830,7 +2482,7 @@ index a513bc7..781e9de 100644
          break;
      }
      case NV097_SET_BLEND_COLOR:
-@@ -4130,6 +5085,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4130,6 +5142,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              }
          }
          s_gpu.drawn_stale = 1;

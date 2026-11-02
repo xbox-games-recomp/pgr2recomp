@@ -7,6 +7,13 @@ import glob,os,sys,re
 GEN=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),'src','recomp','gen','').replace('\\','/')
 PATCHES=[
  # (anchor, replacement[, count]) tuples go here; see rsc2recomp/mm3recomp patch_gen.py for examples.
+ # DirectSound list checks (NOTES 17): recomp_manual.c wraps these.
+ ('void sub_001F0208(void)\n{', 'void sub_001F0208_gen(void)\n{'),
+ ('void sub_001F0883(void)\n{', 'void sub_001F0883_gen(void)\n{'),
+ ('void sub_001F028F(void)\n{', 'void sub_001F028F_gen(void)\n{'),
+ ('void sub_001F0311(void)\n{', 'void sub_001F0311_gen(void)\n{'),
+ # RECOMP_TEST_SUSPEND_RACE_MS (test only, NOTES 17)
+ ('void sub_0018F419(void)\n{', 'void sub_0018F419_gen(void)\n{'),
 ]
 files=sorted(glob.glob(GEN+'recomp_*.c'))
 ok=True

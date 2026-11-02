@@ -350,6 +350,189 @@ void sub_0026DB2D(void)
     g_esp += 12; /* ret 8 */
 }
 
+/*
+ * DirectSound's timer queue and immediate-event list (NOTES 17): the race-end
+ * freeze is a drain spinning on a node that links to itself, which is what
+ * inserting a node that is already queued leaves. The XDK code guards both
+ * inserts with flag bit 2 of the node, under its IRQL lock, so a second
+ * insert means that guard was bypassed or the node's memory was reused while
+ * queued. These wrap the inserts and the drains (patch_gen.py renames the
+ * generated ones to *_gen):
+ *   sub_001F0208  immediate insert, thiscall(core) stdcall(node), ret 4: tail of core+0x4B0
+ *   sub_001F0883  timer insert, same shape: sorted into core+0x4A8
+ *   sub_001F028F  timer DPC body (drains core+0x4A8)
+ *   sub_001F0311  immediate drain (core+0x4B0)
+ * Node: +0 Flink, +4 Blink, +8 flags (1 immediate, 2 queued, 4 repeat),
+ * +0xC owner (vtable +0x24 is the callback), +0x10/+0x14 callback args,
+ * +0x18/+0x1C due time.
+ * RECOMP_DS_LISTCHECK: 1 (default) logs a node inserted while still queued
+ * and unlinks it first, so the list stays a list; 2 logs only; 0 is off.
+ */
+extern void sub_001F0208_gen(void);
+extern void sub_001F0883_gen(void);
+extern void sub_001F028F_gen(void);
+extern void sub_001F0311_gen(void);
+
+static int ds_listcheck(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_DS_LISTCHECK");
+        on = e && *e ? atoi(e) : 1;
+    }
+    return on;
+}
+
+/* 1 if node is on the list at head (bounded walk). */
+static int ds_on_list(uint32_t head, uint32_t node)
+{
+    uint32_t p = MEM32(head);
+    int i;
+    for (i = 0; p && p != head && i < 4096; i++, p = MEM32(p))
+        if (p == node)
+            return 1;
+    return 0;
+}
+
+/* Guest return addresses on the stack, innermost first. */
+static void ds_log_stack(void)
+{
+    uint32_t sp = g_esp, v;
+    int i, n = 0;
+    fprintf(stderr, "  [DSLIST]   guest stack:");
+    for (i = 0; i < 64 && n < 10; i++) {
+        v = MEM32(sp + 4 * i);
+        if (v >= 0x00011000u && v < 0x002A0000u) {
+            fprintf(stderr, " 0x%08X", v);
+            n++;
+        }
+    }
+    fprintf(stderr, "\n");
+}
+
+static void ds_log_node(const char *what, uint32_t core, uint32_t node)
+{
+    uint32_t owner = MEM32(node + 0xC);
+    fprintf(stderr, "  [DSLIST] %s: node 0x%08X flags 0x%X owner 0x%08X (vtable 0x%08X) args 0x%X 0x%X, "
+            "links 0x%08X/0x%08X, on timer queue %d, on immediate list %d (core 0x%08X)\n",
+            what, node, MEM32(node + 8), owner, owner ? MEM32(owner) : 0, MEM32(node + 0x10),
+            MEM32(node + 0x14), MEM32(node), MEM32(node + 4), ds_on_list(core + 0x4A8, node),
+            ds_on_list(core + 0x4B0, node), core);
+    ds_log_stack();
+}
+
+/* A node about to be inserted although it is still on one of the lists:
+ * log it, and (mode 1) unlink it so the insert re-queues it cleanly. */
+static void ds_check_insert(const char *what, uint32_t core, uint32_t node)
+{
+    static unsigned n;
+    int mode = ds_listcheck();
+    if (!mode || (MEM8(node + 8) & 2))
+        return;                 /* bit 2 set: the XDK code dequeues it itself */
+    if (!ds_on_list(core + 0x4A8, node) && !ds_on_list(core + 0x4B0, node))
+        return;
+    if (n++ < 32)
+        ds_log_node(what, core, node);
+    if (mode == 1) {
+        uint32_t f = MEM32(node), b = MEM32(node + 4);
+        MEM32(b) = f;
+        MEM32(f + 4) = b;
+        MEM32(node) = node;
+        MEM32(node + 4) = node;
+    }
+}
+
+/* Entry to a drain: name the first broken link (a node that links to itself
+ * or whose neighbour does not link back). */
+static void ds_check_list(const char *what, uint32_t core, uint32_t head)
+{
+    static unsigned n;
+    uint32_t p, prev = head;
+    int i;
+    if (!ds_listcheck() || n >= 16)
+        return;
+    for (i = 0, p = MEM32(head); p != head && i < 4096; i++, prev = p, p = MEM32(p)) {
+        if (!p || MEM32(p + 4) != prev || MEM32(p) == p) {
+            n++;
+            fprintf(stderr, "  [DSLIST] %s list at 0x%08X broken at entry %d (previous 0x%08X)\n",
+                    what, head, i, prev);
+            if (p)
+                ds_log_node("broken node", core, p);
+            return;
+        }
+    }
+}
+
+void sub_001F0208(void)
+{
+    ds_check_insert("immediate insert of a queued node", g_ecx, MEM32(g_esp + 4));
+    sub_001F0208_gen();
+}
+
+void sub_001F0883(void)
+{
+    ds_check_insert("timer insert of a queued node", g_ecx, MEM32(g_esp + 4));
+    sub_001F0883_gen();
+}
+
+void sub_001F028F(void)
+{
+    ds_check_list("timer queue", g_ecx, g_ecx + 0x4A8);
+    sub_001F028F_gen();
+}
+
+void sub_001F0311(void)
+{
+    ds_check_list("immediate", g_ecx, g_ecx + 0x4B0);
+    sub_001F0311_gen();
+}
+
+/*
+ * Test only: RECOMP_TEST_SUSPEND_RACE_MS=N recreates the race-end freeze of NOTES 17 on demand. The race
+ * teardown (sub_0012D720) suspends the audio meter thread through XAPI SuspendThread (sub_0018F419, from
+ * 0x12D799). Here a host helper thread holds DirectSound's API lock (0x1F6FA4) for N ms; the meter thread,
+ * which reads DirectSound levels every 2 ms (sub_001298E0), queues on it, and the suspend lands while it
+ * waits -- the helper's release then wakes a suspended thread. Off by default.
+ */
+extern void sub_0018F419_gen(void);
+extern void __stdcall xbox_RtlEnterCriticalSection(void *cs);
+extern void __stdcall xbox_RtlLeaveCriticalSection(void *cs);
+__declspec(dllimport) void __stdcall Sleep(unsigned long ms);
+#include <process.h>
+
+static volatile int s_test_hold_ms, s_test_holding;
+
+static void __cdecl test_lock_holder(void *arg)
+{
+    void *cs = arg;
+    xbox_RtlEnterCriticalSection(cs);
+    s_test_holding = 1;
+    Sleep((unsigned long)s_test_hold_ms);
+    s_test_holding = 0;
+    xbox_RtlLeaveCriticalSection(cs);
+}
+
+void sub_0018F419(void)
+{
+    static int hold = -1;
+    if (hold < 0) {
+        const char *e = getenv("RECOMP_TEST_SUSPEND_RACE_MS");
+        hold = e && *e ? atoi(e) : 0;
+    }
+    if (hold > 0 && MEM32(g_esp) == 0x0012D79Eu) {
+        void *cs = (void *)XBOX_PTR(0x001F6FA4u);
+        int i;
+        s_test_hold_ms = hold;
+        _beginthread(test_lock_holder, 0, cs);
+        for (i = 0; i < 1000 && !s_test_holding; i++)
+            Sleep(1);
+        Sleep(10);                          /* the meter polls every 2 ms: let it queue */
+        fprintf(stderr, "  [TEST] race teardown: a helper holds DirectSound's lock for %d ms; suspending the "
+                "meter thread while it waits (meter object 0x%08X)\n", hold, MEM32(0x00457438u));
+    }
+    sub_0018F419_gen();
+}
+
 #if 0 /* RSC2 reference (XDK 5849, RSC2 guest addresses; re-locate before use) */
 /* Device pointer global of the XDK 5849 D3D (g_pDevice). */
 #define RSC2_D3D_DEVICE 0x00375418u

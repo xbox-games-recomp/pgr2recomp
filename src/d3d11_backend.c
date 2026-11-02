@@ -119,10 +119,13 @@ static const char s_hlsl[] =
 "}\n"
 "float4 sample_stage(uint st, float2 uv) {\n"
 "  float2 c = uv * stage_scale[st].xy;\n"
-"  if (st == 0u) return tex0.Sample(smp0, c);\n"
-"  if (st == 1u) return tex1.Sample(smp1, c);\n"
-"  if (st == 2u) return tex2.Sample(smp2, c);\n"
-"  return tex3.Sample(smp3, c);\n"
+"  float4 v;\n"
+"  if (st == 0u) v = tex0.Sample(smp0, c);\n"
+"  else if (st == 1u) v = tex1.Sample(smp1, c);\n"
+"  else if (st == 2u) v = tex2.Sample(smp2, c);\n"
+"  else v = tex3.Sample(smp3, c);\n"
+"  if (stage_scale[st].w > 0.5) v.rgb = 1.0 - v.rgb;\n"
+"  return v;\n"
 "}\n"
 /* CUBEMAP stage: face and (s,t) as nv2a_pb_exec.c rc_stage_fetch picks them. */
 "float4 cube_fetch(uint st, float3 d) {\n"
@@ -449,6 +452,7 @@ typedef struct {
     ID3D11Texture2D *snap_tex;          /* copy of the surface, for a draw that samples it */
     ID3D11ShaderResourceView *snap_srv;
     uint32_t guest_sig;                 /* guest_hash of its memory when last synced (rt_take_cpu_writes) */
+    uint32_t guest_sig_bytes;           /* how many bytes guest_sig covers (0: w*h*4) */
 } RT;
 
 typedef struct {
@@ -949,6 +953,7 @@ static RT *get_rt(const Nv2aSurface *s)
     r->w = cw;
     r->h = ch;
     r->guest_sig = guest_hash(r->va, cw * ch * 4u);
+    r->guest_sig_bytes = 0;
     {
         float zero[4] = { 0, 0, 0, 0 };
         ID3D11DeviceContext_ClearRenderTargetView(s_ctx, r->rtv, zero);
@@ -1051,7 +1056,23 @@ static void rt_take_cpu_writes(RT *r, const Nv2aTexture *t)
     if (on < 0) { const char *e = getenv("RECOMP_D3D11_CPUWRITES"); on = !(e && e[0] == '0'); }
     if (!on || !r->tex)
         return;
-    sig = guest_hash(r->va, r->w * r->h * 4u);
+    {
+        /* Only the bytes the texture reads: a B8 surface sampled as Y8 is w*h bytes, and
+         * hashing w*h*4 took changes in whatever lies after it for CPU writes (PGR2's
+         * 256x256 sun mask was overwritten with its own untouched memory every ~11 flips). */
+        Nv2aTexture l0 = *t;
+        uint32_t bytes;
+        l0.levels = 1;
+        bytes = nv2a_backend_cube_face_stride(&l0);
+        if (!bytes || bytes > r->w * r->h * 4u)
+            bytes = r->w * r->h * 4u;
+        sig = guest_hash(r->va, bytes);
+        if (bytes != (r->guest_sig_bytes ? r->guest_sig_bytes : r->w * r->h * 4u)) {
+            r->guest_sig_bytes = bytes;          /* new footprint: take it as the baseline */
+            r->guest_sig = sig;
+            return;
+        }
+    }
     if (sig == r->guest_sig)
         return;
     r->guest_sig = sig;
@@ -1676,7 +1697,7 @@ static void set_viewport(uint32_t w, uint32_t h)
 
 /* RECOMP_D3D11_LOGFILE: the flip to log once the trigger file appears (see be_draw_ext).
  * Polled at most once per flip. */
-static long s_logstep_a = -1, s_logstep_b = -1;
+static long s_logstep_a = -1, s_logstep_b = -1, s_logstep_s = 1;
 /* F12 (flight recorder) also logs the batches of the next flip, as the trigger file does. */
 static volatile LONG s_log_f12;
 static int logfile_flip(void)
@@ -1694,8 +1715,10 @@ static int logfile_flip(void)
         if (armed == (uint64_t)-1 && GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
             FILE *f = fopen(path, "r");      /* optional "<from>-<to>": the RECOMP_D3D11_LOGSTEP batch range */
             if (f) {
-                long a, b;
-                if (fscanf(f, "%ld-%ld", &a, &b) == 2) { s_logstep_a = a; s_logstep_b = b; }
+                long a, b, st = 1;   /* "<from>-<to>[/<stride>]" */
+                if (fscanf(f, "%ld-%ld/%ld", &a, &b, &st) >= 2) {
+                    s_logstep_a = a; s_logstep_b = b; s_logstep_s = st > 0 ? st : 1;
+                }
                 fclose(f);
             }
             DeleteFileA(path);
@@ -1874,26 +1897,35 @@ static void log_batch(uint64_t idx, const Nv2aSurface *s, const Nv2aBatch *b, co
         fprintf(stderr, "    rc%u%s cicw %08X cocw %08X aicw %08X aocw %08X f0 %08X f1 %08X\n", st, st < (x->rc.control & 0xFF) ? "" : "(unused)", x->rc.color_icw[st],
                 x->rc.color_ocw[st], x->rc.alpha_icw[st], x->rc.alpha_ocw[st], x->rc.factor0[st], x->rc.factor1[st]);
     fprintf(stderr, "    final_c0 %08X final_c1 %08X ctl %08X\n", x->rc.final_c0, x->rc.final_c1, x->rc.control);
+    if (x->vsh)
+        fprintf(stderr, "    fog en %u mode %X param %g %g colour %.3f %.3f %.3f\n", x->vsh->fog_enable, x->vsh->fog_mode,
+                x->vsh->fog_param[0], x->vsh->fog_param[1], x->fog_color[0], x->fog_color[1], x->fog_color[2]);
+    if (rs->stencil_enable)
+        fprintf(stderr, "    stencil func %X ref %02X mask %02X write %02X ops fail %X zfail %X zpass %X zfmt %u\n",
+                rs->stencil_func, rs->stencil_ref & 0xFF, rs->stencil_func_mask & 0xFF, rs->stencil_write_mask & 0xFF,
+                rs->stencil_fail, rs->stencil_zfail, rs->stencil_zpass, rs->zeta_format);
     for (st = 0; st < 4; st++) {
         const Nv2aStageInfo *si = &x->stage[st];
         if (si->mode)
-            fprintf(stderr, "    stage%u mode %u valid %u tex %08X %ux%u fmt %02X%s%s\n", st, si->mode, si->valid,
-                    si->tex.offset, si->tex.width, si->tex.height, si->tex.color,
-                    si->normalised ? " norm" : " lin", si->cube ? " cube" : "");
+            fprintf(stderr, "    stage%u mode %u valid %u tex %08X %ux%u fmt %02X%s%s addr %u/%u border %u %08X\n",
+                    st, si->mode, si->valid, si->tex.offset, si->tex.width, si->tex.height, si->tex.color,
+                    si->normalised ? " norm" : " lin", si->cube ? " cube" : "",
+                    si->tex.addr_u, si->tex.addr_v, si->tex.border_color, si->tex.border);
+    }
+    if (x->vsh && x->vsh->constants) {
+        /* RECOMP_D3D11_LOGCONST=<a>-<b>: also the programme's constants c[a..b] (held geometry too). */
+        static int ca = -2, cb2;
+        uint32_t i;
+        if (ca == -2) { const char *e = getenv("RECOMP_D3D11_LOGCONST"); ca = -1; if (e) sscanf(e, "%d-%d", &ca, &cb2); }
+        for (i = (uint32_t)(ca < 0 ? 1 : ca); ca >= 0 && (int)i <= cb2 && i < 192; i++)
+            fprintf(stderr, "    c[%u] = %g %g %g %g\n", i, x->vsh->constants[i][0], x->vsh->constants[i][1],
+                    x->vsh->constants[i][2], x->vsh->constants[i][3]);
     }
     if (x->vsh && x->vsh->attrs) {   /* not for geometry the back end holds (geom_key) */
         const Nv2aVshBatch *vb = x->vsh;
         uint32_t i, k;
         fprintf(stderr, "    vsh on GPU: %u verts x %u attrs, %u indices\n", vb->nverts, vb->stride, vb->nindices);
         /* input -> slot map, and the first vertices' attributes (texcoords, colours) */
-        {
-            /* RECOMP_D3D11_LOGCONST=<a>-<b>: also the programme's constants c[a..b]. */
-            static int ca = -2, cb2;
-            if (ca == -2) { const char *e = getenv("RECOMP_D3D11_LOGCONST"); ca = -1; if (e) sscanf(e, "%d-%d", &ca, &cb2); }
-            for (i = (uint32_t)(ca < 0 ? 1 : ca); ca >= 0 && (int)i <= cb2 && i < 192; i++)
-                fprintf(stderr, "    c[%u] = %g %g %g %g\n", i, vb->constants[i][0], vb->constants[i][1],
-                        vb->constants[i][2], vb->constants[i][3]);
-        }
         {
             /* per slot: non-finite components and the largest magnitude */
             uint32_t s2, bad, nb = 0;
@@ -2059,6 +2091,7 @@ static void vsh_temp_name(char *b, size_t n, uint32_t t)
 
 /* HLSL for one program, or NULL when it does something not handled (a write
  * to c[], which the CPU path then keeps doing). */
+static uint32_t s_gen_hash;
 static char *vsh_generate(const uint32_t (*prog)[4], uint32_t len)
 {
     Str s = { NULL, 0, 0 };
@@ -2187,9 +2220,20 @@ static char *vsh_generate(const uint32_t (*prog)[4], uint32_t len)
         }
         sapp(&s, "  }\n");
     }
+    {
+        /* Experiment: RECOMP_D3D11_FOGW=<vsh hash> takes that programme's fog distance from oPos.w. */
+        static int fogw = -1; static uint32_t fogw_hash;
+        if (fogw < 0) { const char *e = getenv("RECOMP_D3D11_FOGW"); fogw = e != NULL; if (e) fogw_hash = (uint32_t)strtoul(e, NULL, 16); }
+        /* Experiment: RECOMP_D3D11_FOGSPEC=<vsh hash>: that programme's fog factor is its specular alpha. */
+        static int fogs = -1; static uint32_t fogs_hash;
+        if (fogs < 0) { const char *e = getenv("RECOMP_D3D11_FOGSPEC"); fogs = e != NULL; if (e) fogs_hash = (uint32_t)strtoul(e, NULL, 16); }
+        if (fogs && s_gen_hash == fogs_hash)
+            sapp(&s, "  o.fog = saturate(O4.w);\n");
+        else
+            sapp(&s, fogw && s_gen_hash == fogw_hash ? "  o.fog = fogf(abs(oPos.w));\n" : "  o.fog = fogf(O5.x);\n");
+    }
     sapp(&s,
         "  o.d0 = saturate(O3); o.d1 = saturate(O4);\n"
-        "  o.fog = fogf(O5.x);\n"
         "  o.t0 = O9; o.t1 = O10; o.t2 = O11; o.t3 = O12;\n"
         "  if (asuint(oPos.w) == 0u) oPos.w = 1.0;\n"
         "  float w = oPos.w;\n"
@@ -2410,6 +2454,7 @@ static int be_vsh_gpu(const uint32_t (*prog)[4], uint32_t len, uint32_t hash)
     s_vsh[slot].state = 0;
     s_vsh_n++;
     s_vsh_compiles++;
+    s_gen_hash = hash;
     src = vsh_generate(prog, len);
     if (!src) {
         s_vsh[slot].state = 2;
@@ -2923,6 +2968,15 @@ static void be_draw_ext(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aBatc
                     return;
             }
         }
+        {
+            /* Experiment: RECOMP_D3D11_SKIPMASKFILL=1 drops PGR2's sun-mask fill quad (vsh
+             * C8AF571F into a 1-byte surface with front faces culled). */
+            static int smf = -1;
+            if (smf < 0) { const char *e = getenv("RECOMP_D3D11_SKIPMASKFILL"); smf = e && e[0] == '1'; }
+            if (smf && x->vsh_hash == 0xC8AF571Fu && s->bytes_per_pixel == 1 && rs->cull_enable
+                && rs->cull_face == 0x404)
+                return;
+        }
         if (has_only && x->vsh_hash != only)
             return;
         if (has_skip && x->vsh_hash == skip)
@@ -3102,10 +3156,22 @@ vertices_ready:
                     tw = s_rt[k].w; th = s_rt[k].h;
                     break;
                 }
+            if (si->tex.color == 0x13 && logfile_flip())     /* where a linear Y8 read comes from */
+                fprintf(stderr, "    stage%u reads %s %ux%u\n", st, k < s_rt_n ?
+                        (s_rt[k].snap_srv == srvs[st] ? "RT snapshot" : "RT") : "decoded guest memory", tw, th);
             for (k = 0; k < s_zb_n && s_res > 1; k++)
                 if (s_zb[k].view_wide && s_zb[k].view_srv && s_zb[k].view_srv == srvs[st])
                     cb.stage_scale[st][2] = (float)s_res;
             cb.stage_valid[st] = 1;
+            {
+                /* Experiment: RECOMP_D3D11_Y8INV=1 reads a rendered surface sampled as Y8 inverted. */
+                static int inv = -1;
+                if (inv < 0) { const char *e = getenv("RECOMP_D3D11_Y8INV"); inv = e && e[0] == '1'; }
+                if (inv && si->tex.color == 0x13)
+                    for (k = 0; k < s_rt_n; k++)
+                        if (s_rt[k].srv && (s_rt[k].srv == srvs[st] || s_rt[k].snap_srv == srvs[st]))
+                            cb.stage_scale[st][3] = 1.0f;
+            }
             if (!si->normalised) {
                 cb.stage_scale[st][0] = 1.0f / (float)tw;
                 cb.stage_scale[st][1] = 1.0f / (float)th;
@@ -3256,7 +3322,21 @@ no_atest:
         bf[1] = (float)((rs->blend_color >> 8) & 0xFF) / 255.0f;
         bf[2] = (float)(rs->blend_color & 0xFF) / 255.0f;
         bf[3] = (float)(rs->blend_color >> 24) / 255.0f;
-        ID3D11DeviceContext_OMSetBlendState(s_ctx, get_blend(rs), bf, 0xFFFFFFFFu);
+        {
+            /* Experiment: RECOMP_D3D11_MASKBLEND=1 turns on the blend PGR2's sun-glow quads set but leave
+             * disabled (ONE_MINUS_DST_COLOR, ONE: a screen blend), so the glow adds to the reflected sky in
+             * the 1-byte sun mask instead of replacing it. */
+            static int mb = -1;
+            Nv2aRenderState rb;
+            if (mb < 0) { const char *e = getenv("RECOMP_D3D11_MASKBLEND"); mb = e && e[0] == '1'; }
+            if (mb && x->vsh_hash == 0xC8AF571Fu && s->bytes_per_pixel == 1 && x->vsh && !x->vsh->fog_enable
+                && !rs->blend_enable) {
+                rb = *rs;
+                rb.blend_enable = 1;
+                ID3D11DeviceContext_OMSetBlendState(s_ctx, get_blend(&rb), bf, 0xFFFFFFFFu);
+            } else
+                ID3D11DeviceContext_OMSetBlendState(s_ctx, get_blend(rs), bf, 0xFFFFFFFFu);
+        }
         ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, get_ds(rs, z != NULL), rs->stencil_ref & 0xFF);
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &r->rtv, z ? z->dsv : NULL);
         {
@@ -3450,7 +3530,8 @@ grade_drawn:;
                     }
                 }
                 if (s_logstep_a >= 0) { la = s_logstep_a; lb = s_logstep_b; }
-                if (la >= 0 && (long)(s_draws_this_flip - 1) >= la && (long)(s_draws_this_flip - 1) <= lb && logfile_flip()) {
+                if (la >= 0 && (long)(s_draws_this_flip - 1) >= la && (long)(s_draws_this_flip - 1) <= lb
+                    && ((long)(s_draws_this_flip - 1) - la) % s_logstep_s == 0 && logfile_flip()) {
                     char p[460];
                     snprintf(p, sizeof p, "%s%llu_b%04ld.bmp", lp, (unsigned long long)s_flip_count + 1, (long)(s_draws_this_flip - 1));
                     g_dump_alpha = 0;
@@ -4088,6 +4169,7 @@ static RT *memory_frame(void)
                     ID3D11Texture2D_Release(st);
                     /* Our own write, not the CPU's: rt_take_cpu_writes must not re-take it. */
                     s_rt[i].guest_sig = guest_hash(s_rt[i].va, s_rt[i].w * s_rt[i].h * 4u);
+                    s_rt[i].guest_sig_bytes = 0;
                 }
                 fprintf(stderr, "[D3D11] display memory %08X takes over at flip %llu: %u black pixels filled from the surface\n",
                         va, (unsigned long long)s_flip_count, n);
