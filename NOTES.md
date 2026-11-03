@@ -274,7 +274,7 @@ Kept from the investigation (harmless, correct):
   visible floods the screen with sun glare (the game tests the sun).
 - F12 also logs every batch of the next flip to stderr (`[D3D11] F12: logging flip N`, then `f<N> b...`).
 
-## 15. Shadows that build up on sunlit road (NOT fixed); the car shadow map was never cleared (fixed)
+## 15. Shadows that build up on sunlit road: alpha kill, shadow compare, polygon offset and border colour (fixed); the car shadow map was never cleared (fixed)
 
 User recording `flicker\20261101_170538` (from #217): hard-edged shadow darkens more and more on the road as the
 car drives on, only where the sun falls. **Still there after the fix below (user, same evening).** Looked at
@@ -418,6 +418,95 @@ so "builds up" is which road pieces are in view.
   What is still missing is the hardware reason for a fully fogged fill (oFog = 1/rhw = 1 by the passthrough
   programme, `o5 = rcp(v0.w)`) and for the glow quads' blend. Next: the user's RenderDoc capture of xemu at the
   plaza, to see xemu's `807D8000` after b612-b614 and what a near-road pixel samples from it.
+- **Looking for the rule on the NV2A side** (runs g1-g3, 2026-11-03, Duomo 1 grid, `one_on_one.ps1`; no code
+  change). The full method trace of one flip (`RECOMP_FRAME_TRACE` + `_METHODS`, run g3) shows every register
+  the three mask draws see. Ruled out:
+  - The blend. `0x0304` (BLEND_ENABLE) = 0 is written right after the surface switch to `807D8000`, before the
+    fill. The `307/1` blend functions are left over from the main scene, which had blend on. `MASKBLEND` is not
+    a state we drop.
+  - Back colours. The fill sets only the front diffuse (`0x194C` = 0). Back diffuse (`0x195C`) is still
+    FFFFFFFF from the glow draws of the previous frame, and the fill is back-facing by our winding. So a
+    rasteriser that picks `oB0` for back faces would draw it white. But two-sided lighting is off
+    (`0x17C4` = 0), and xemu never reads `vtxB0/B1` in its pixel shader (psh.c master: `pB0` is declared and
+    not used). So that is not what xemu shows.
+  - The glow quads culled by the far clip. In the mask pass, `c0.w` (the w-buffer scale = 2^24/far) is 559250
+    for the fill (far 30) and 223701 for the glows (far 75, CLIP_MIN 22370). Glow w = 44.75 x 223701 = 1.0e7,
+    which is inside CLIP_MAX 16777215, so they are drawn. Our `ZDISCARD` keeps them too (dumps after b577-b579:
+    mean 3, then 8 with the glow).
+  - Fog from |oPos.w| as a general rule (what `FOGW` does). It is harmless for the HUD (`c0.w` = 1 there, so
+    oPos.w = 1/rhw = oFog). But world programmes' oPos.w carries the same w-buffer scale (the near clip of world
+    draws is 55.9998 = 0.01 m x 5599.98, and the sun occlusion quad b2166 is depth-tested against the world),
+    so world fog from oPos.w would fog everything past 10 cm. The road writes oFog = view z (`O5.x = R10.z`),
+    which only makes sense if oFog is the fog source, as xemu assumes.
+  - The fill state itself: fog gen PLANAR (`0x02A0` = 2), fog on (`0x02A4` = 1), LINEAR (`0x029C` = 0x2601),
+    params 2, -1/75, 0 (`0x09C0..C8`), viewport offset 128.53 / scale (128, -128, 2^24-1), immediate vertices by
+    `SET_VERTEX4F` (0,0,1,1) ... (0,256,1,1), diffuse by `SET_VERTEX_DATA4UB` 0. Same as our state.
+  - xemu master's formulas, read again (vsh.c, vsh-prog.c, psh.c): programmes use `fogDistance = oFog.x`,
+    `vtxFog = oFog.x`, `pFog = vec4(fogColor.rgb, clamp(vtxFog, 0, 1))`, no back colours, and fog param
+    registers straight from the methods. By xemu's own code the fill is 0.987 fog, 3/255, as ours.
+  So both the NV2A state and xemu's code give a near-black fill. With that mask, the near road (which clamps to
+  the bottom row: `t/q = 128 + 241*|y|/z`) gets almost no sheen, but the sheen in the user's xemu shots is
+  strong across the whole near road. Whatever makes xemu's mask bright is outside its shader formulas: its
+  surface/texture path for a B8 surface sampled as Y8 (xemu renders B8 as GL_R8 and always takes the download
+  and upload path), the guest memory it uploads, or a newer build than master. Only a capture can decide it.
+  Needed: xemu's `807D8000` contents after the third mask draw (or the texture bound to stage 3 of a
+  `1E311CB8` draw) at the Duomo 1 grid, or the same spot on a console. Until then `FOGW=C8AF571F` +
+  `MASKBLEND=1` stay experiments, off by default.
+- **The xemu captures (2026-11-03, user's RenderDoc captures `Downloads\pgr2-frame18804..18809.rdc`, Duomo 1 start
+  straight, car parked at x -841.6).** Read with qrenderdoc's Python (`qrenderdoc.exe --python <script>`; the
+  scripts are `rd*.py` in the session scratchpad). xemu presents at the host rate, so one RenderDoc frame is a slice
+  of a game frame: 18807 has the three mask draws, 18808 the scene up to the props, 18809 the decals.
+  - **The mask is not it.** xemu's `807D8000` (768x768 R8 at its 3x scale, and the 256x256 R8 texture the road reads)
+    is as dark as ours: fill about 1/255, the glow at the left edge up to 74/255, bottom row 0. The road's T3 term is
+    about zero in xemu too. `FOGW` and `MASKBLEND` brightened the road for the wrong reason; they stay off.
+  - xemu's road draws (`1E311CB8`, `45FE3B25`) match ours: the same combiner formula (xemu's GLSL), constants
+    (`c147` = 1, `c150` as ours), vertex data (the vertex colour bytes found again in our guest memory with cdb `s -b`),
+    textures (our DXT decode of `81158E80` and `810AF180` has the same mean RGBA as xemu's) and strip order. At the
+    same spot (our car within 1 m, `rt:3910` from the grid) the near road was still 2.5x darker in ours.
+  - New diagnostic: `RECOMP_D3D11_DBGFILE` mode 19 paints each batch a flat colour from its batch index (as mode 8 does
+    per programme), so a frame dump says which batch wrote a pixel. With it and `LOGSTEP` (one batch at a time):
+    the near road is drawn bright by the road piece (b1300 here), then **b1836 multiplies it by 0.37**. b1836 is
+    `F23A56D2`, the car's sun-shadow receiver: a flat ground mesh 1 cm above the road around the car (84 vertices),
+    colour `c147` = 0.369, blend (ZERO, SRC_COLOR), stage 0 a PROJECT3D lookup into the car's shadow map `80A11000`
+    (format 0x30, LU_IMAGE_DEPTH_Y16) with `SET_SHADOW_DEPTH_FUNC` LESS (`0x1E6C` = 1; the car draws that read the
+    same map for self-shadowing use 6, GEQUAL -- an earlier note had the receiver at 6), and the combiner never
+    reads T0. What restricts it to the car's shadow on the hardware is the texture stage's **alpha kill**
+    (`SET_TEXTURE_CONTROL0` bit 2, `0x4003FFC4`): the shadow compare returns 0 or 1 in every channel and a texel with
+    alpha 0 discards the pixel. We implemented neither, so the whole mesh darkened the road around the car: the large
+    straight-edged dark areas that move with the car and the view.
+- **Fixed (hardware features, all on by default, each with a knob):**
+  - Alpha kill (`Nv2aStageInfo.alpha_kill` from `SET_TEXTURE_CONTROL0`, toolkit; the back end discards when a
+    stage with it has texel alpha 0, as xemu's `if (tN.a == 0.0) discard`). `RECOMP_D3D11_ALPHAKILL=0` turns it off.
+  - Shadow-map compare (`Nv2aRenderState.shadow_func` from `SET_SHADOW_DEPTH_FUNC`, toolkit; `shadow_fetch` in the
+    back end, after xemu's `psh_append_shadowmap`): a PROJECT2D/3D stage on a depth-format texture (0x2A-0x31)
+    returns `(depth x max) FUNC clamp(r/q, 0, max)`, max 0xFFFF for Y16, 0xFFFFFF for X8_Y24. `RECOMP_D3D11_SHADOWCMP=0`
+    samples plainly as before; `=2` (diagnostic) swaps the operands.
+  - Polygon offset (`Nv2aRenderState.poly_offset_*` from `SET_POLY_OFFSET_FILL_ENABLE` `0x0338` and
+    `SET_POLYGON_OFFSET_SCALE_FACTOR/_BIAS` `0x0384/0x0388`, toolkit). Z-buffered draws: the rasterizer's depth bias
+    (D24 steps; slope x the internal resolution). W-buffered draws: added to the depth `PSW` writes, units plus factor x
+    the largest depth slope, as xemu's `depthOffset + depthFactor x triMZ`. About 120 draws a frame use it: road
+    decals (-0.25 / -1) and the car shadow map (8 / 128). `RECOMP_D3D11_POLYOFFSET=0` turns it off.
+  - Verified at the plaza spot (frame dumps g28 vs g29 = `ALPHAKILL=0`, against xemu's frame): near-left road mean
+    101 (xemu 96, before 37), the darker band further out as in xemu, and a car shadow beside the car. The rest of the
+    run (grid, start, first corner) shows no holes in alpha-tested objects and the HUD is intact.
+- **The car shadow's shape: border colour (fixed, runs g40-g46, 2026-11-03).** Two dark straight-edged wedges near
+  the car (bottom-left of the screen, and a band right of the car) that xemu does not have. Found with two new
+  `DBGFILE` views of the receiver (mode 20: stored depth, r/q and q < 0 as RGB; 21: the compare margin, both written
+  unblended) switched in turn on a parked car, and a dump of the shadow map itself (`RECOMP_D3D11_ZVIEWDUMP=<path>`:
+  when `<path>.go` holds a depth buffer's address, the view as sampled is written to `<path>.pgm`, 16-bit):
+  - The shadow map is right: cleared to 0xFFFF, the car in the middle of 1024x1024, a margin all round.
+  - The receiver mesh (about 8 x 13 m) projects past the map. Its stage addresses with BORDER (4/4), border source
+    "colour", `SET_TEXTURE_BORDER_COLOR` FFFFFFFF (far: lit under LESS). Our samplers never set a border colour, so
+    D3D11's transparent black was read as depth 0, and `0 < r` shadowed everything outside the map: the wedges are
+    the map's edges projected onto the road. Sampled pixels across the views all agree with LESS.
+  - Fix: `get_sampler` sets `BorderColor` from the stage's border colour when FORMAT's border source selects it,
+    and clamps when it selects the texture (as the executor's software path does). `RECOMP_D3D11_BORDER=0`: the old
+    black border. One other texture uses border addressing in the race frame (`80825080`, border 00FFFFFF).
+  - Verified at the plaza spot (g45 fixed vs g46 `BORDER=0`, xemu's frame): right of the car 85 / 78 (xemu 82 / 73,
+    before 35 / 33), bottom-left 103 (xemu 96, before 85), and the car's shadow falls to its right as in xemu. The
+    rest of the run differs only by timing (the white fade into the race lands a frame earlier); no new artifacts.
+  - A lead for the near-black player car (Next 2): the car draws (`420C5AC3`) read the same map on stage 1 with
+    GEQUAL and CLAMP addressing for self-shadowing; worth checking what their combiners do with T1.
 - Hangs seen while doing this (runs sh3, sh5, earlier ir1): the DISPATCH gate holder in a guest loop with
   no kernel calls, twice right at the grid; one with "383 refused" (holder inside an ISR). The IRQL/TIB
   probe added in 17 was in all three builds and is removed again (it never fired; ruling out a timing
@@ -736,8 +825,9 @@ thread in `~*`): not a game bug.
    AI, results and replay check out at 60. Default stays 30 (the user's call, 2026-11-02). Test runs: the scripts start the game with a hidden window, which
    throttles vsync'd presents; frame-rate measurements need a visible window or vsync off.
 
-0. Sunlit road (15): the hardware rule behind `FOGW` + `MASKBLEND` -- needs the user's xemu RenderDoc capture of
-   the plaza (`807D8000` after b612-b614, a near-road pixel's T3 sample).
+0. Sunlit road (15): the darkening was the car-shadow receiver without alpha kill / shadow compare (fixed, with
+   polygon offset); the two leftover wedges were the sampler's missing border colour (fixed). Matches xemu at the
+   plaza spot.
 1. The DirectSound list corruption of 17 (the user's KeQuerySystemTime spin): not seen since; `RECOMP_DS_LISTCHECK`
    logs the inserter of a queued node and repairs it. Port `xbox_SuspendGuestThread` (17) to rsc2/mm3's patch.
 2. The user drives a full race (window, input feel, audio); the black player car (xemu shader cache comparison).

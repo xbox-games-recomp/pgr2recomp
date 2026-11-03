@@ -62,6 +62,9 @@ static const char s_hlsl[] =
 "  uint4 dbg;\n"
 "  uint4 dotx;\n"
 "  float4 zclip;\n"
+"  float4 poffs;\n"
+"  uint4 shadow;\n"
+"  uint4 akill;\n"
 "};\n"
 /* flags: bit0 run combiners, bit1 alpha test, bits4-7 alpha func;
  * dotx: SET_DOT_RGBMAPPING, SET_SHADER_OTHER_STAGE_INPUT */
@@ -142,12 +145,30 @@ static const char s_hlsl[] =
 "  if (st == 2u) return ctex2.Sample(smp2, c);\n"
 "  return ctex3.Sample(smp3, c);\n"
 "}\n"
+/* A projective stage reading a depth-format texture is a shadow-map lookup on the NV2A
+ * (xemu psh_append_shadowmap): the stored depth, at the format's full scale, against
+ * r/q (PROJECT3D) or 0 (PROJECT2D) under SET_SHADOW_DEPTH_FUNC, 1 or 0 in every
+ * channel. shadow[st]: 8 | func | class << 4, class 0 Y16, 1 X8_Y24, 2 Y16 float. */
+"float4 shadow_fetch(uint st, float4 tc, uint mode) {\n"
+"  uint s = shadow[st], f = s & 7u;\n"
+"  if (f == 0u) return float4(0, 0, 0, 0);\n"
+"  if (f == 7u) return float4(1, 1, 1, 1);\n"
+"  float q = (tc.w != 0.0) ? tc.w : 1.0;\n"
+"  uint cls = (s >> 4) & 3u;\n"
+"  float mx = cls == 1u ? 16777215.0 : cls == 2u ? 511.9375 : 65535.0;\n"
+"  float d = sample_stage(st, tc.xy / q).x * mx;\n"
+"  float r = mode == 2u ? clamp(tc.z / q, 0.0, mx) : 0.0;\n"
+"  if ((s & 64u) != 0u) { float t = d; d = r; r = t; }\n"
+"  bool ok = f == 1u ? d < r : f == 2u ? d == r : f == 3u ? d <= r : f == 4u ? d > r : f == 5u ? d != r : d >= r;\n"
+"  return ok ? float4(1, 1, 1, 1) : float4(0, 0, 0, 0);\n"
+"}\n"
 /* One texture stage by its SHADER_STAGE_PROGRAM mode (rc_stage_fetch). */
 "float4 fetch_stage(uint st, float4 tc) {\n"
 "  uint mode = (stage_program >> (st * 5u)) & 31u;\n"
 "  float q = (tc.w != 0.0) ? tc.w : 1.0;\n"
 "  float4 white = float4(1, 1, 1, 1);\n"
 "  if (mode == 0u) return float4(0, 0, 0, 1);\n"
+"  if ((mode == 1u || mode == 2u) && shadow[st] != 0u) return stage_valid[st] ? shadow_fetch(st, tc, mode) : white;\n"
 "  if (mode == 1u || mode == 2u) return stage_valid[st] ? sample_stage(st, tc.xy / q) : white;\n"
 "  if (mode == 3u) {\n"
 "    if (stage_valid[st] == 2u) return cube_fetch(st, tc.xyz);\n"
@@ -306,16 +327,36 @@ static const char s_hlsl[] =
 "      return m < 14u ? float4(t.rgb, 1) : float4(t.aaa, 1);\n"
 "    }\n"
 "    if (m == 18u) return float4(saturate(i.t2.xyz * 0.5 + 0.5), 1);\n"
+"    if (m == 20u || m == 21u) {\n"
+"      float4 tc[4] = { i.t0, i.t1, i.t2, i.t3 };\n"
+"      uint st = shadow[0] != 0u ? 0u : shadow[1] != 0u ? 1u : shadow[2] != 0u ? 2u : 3u;\n"
+"      float4 t = tc[st];\n"
+"      uint cls = (shadow[st] >> 4) & 3u;\n"
+"      float mx = cls == 1u ? 16777215.0 : cls == 2u ? 511.9375 : 65535.0;\n"
+"      float q = t.w != 0.0 ? t.w : 1.0;\n"
+"      float2 uv = t.xy / q;\n"
+"      float d = sample_stage(st, uv).x;\n"
+"      float r = t.z / q / mx;\n"
+"      float fl = q < 0.0 ? 1.0 : 0.0;\n"
+"      if (m == 20u) return float4(d, saturate(r), fl, 1);\n"
+"      return float4(saturate(0.5 + (d - r) * 256.0), r < 0.0 ? 1.0 : r > 1.0 ? 0.5 : 0.0, fl, 1);\n"
+"    }\n"
 "  }\n"
 "  if (dbg.z != 0u) i.d1 = float4(0, 0, 0, 1);\n"
 "  if (flags & 1u) {\n"
 "    float4 fog = float4(fogc.rgb, i.fog);\n"
 "    float4 tc[4] = { i.t0, i.t1, i.t2, i.t3 }, T[4];\n"
 "    fetch_all(tc, T);\n"
+"    [unroll] for (uint st = 0u; st < 4u; st++)\n"
+"      if (((akill.x >> st) & 1u) != 0u && T[st].a == 0.0) discard;\n"
 "    c = run_rc(i.d0, i.d1, fog, T[0], T[1], T[2], T[3]);\n"
 "  } else {\n"
 "    c = i.d0;\n"
-"    if (stage_valid.x) c *= sample_stage(0u, i.t0.xy);\n"
+"    if (stage_valid.x) {\n"
+"      float4 t = sample_stage(0u, i.t0.xy);\n"
+"      if ((akill.x & 1u) != 0u && t.a == 0.0) discard;\n"
+"      c *= t;\n"
+"    }\n"
 "    c = saturate(c);\n"
 "  }\n"
 "  if (flags & 2u) {\n"
@@ -338,7 +379,8 @@ static const char s_hlsl[] =
  * linear in distance, not z/w. SV_Position.w is the guest w, interpolated
  * perspective-correct; the clip range is in the same units. */
 "float4 PSW(VSOut i, out float dep : SV_Depth) : SV_Target {\n"
-"  dep = saturate(i.pos.w * zscale);\n"
+"  float w = i.pos.w * zscale;\n"
+"  dep = saturate(w + poffs.x + poffs.y * max(abs(ddx(w)), abs(ddy(w))));\n"
 "  return ps_main(i);\n"
 "}\n"
 /* Fullscreen blit: one big triangle, no vertex buffer. */
@@ -430,6 +472,9 @@ typedef struct {
     uint32_t dbg[4];
     uint32_t dotx[4];
     float zclip[4];         /* x..y: depth range kept (0..1); z != 0: discard outside it */
+    float poffs[4];         /* a w-buffered draw's polygon offset: x units, y slope factor (poly_offset) */
+    uint32_t shadow[4];     /* per stage: 0, or 8 | shadow func | depth class << 4 (shadow_fetch) */
+    uint32_t akill[4];      /* x: stages whose texel alpha 0 discards the pixel (bit per stage) */
 } CBData;
 
 /* One vertex as the GPU reads it. */
@@ -1193,6 +1238,50 @@ static ID3D11ShaderResourceView *depth_view(ZB *z, const Nv2aTexture *t)
         z->dirty = 0;
         sc_invalidate();
     }
+    {
+        /* RECOMP_D3D11_ZVIEWDUMP=<path>: when <path>.go exists and holds this buffer's address
+         * (hex), write the depth view as it is sampled now to <path>.pgm (16-bit) once. */
+        static const char *zp = (const char *)1;
+        if (zp == (const char *)1) zp = getenv("RECOMP_D3D11_ZVIEWDUMP");
+        if (zp) {
+            char go[600], out[600];
+            FILE *f;
+            unsigned va = 0;
+            snprintf(go, sizeof go, "%s.go", zp);
+            f = fopen(go, "r");
+            if (f) { if (fscanf(f, "%x", &va) != 1) va = 0; fclose(f); }
+            if (va && va == z->va) {
+                D3D11_TEXTURE2D_DESC sd;
+                ID3D11Texture2D *stg = NULL;
+                D3D11_MAPPED_SUBRESOURCE m;
+                ID3D11Texture2D_GetDesc(z->view_tex, &sd);
+                sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                DeleteFileA(go);
+                if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &sd, NULL, &stg))) {
+                    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)stg, (ID3D11Resource *)z->view_tex);
+                    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)stg, 0, D3D11_MAP_READ, 0, &m))) {
+                        uint32_t yy, xx;
+                        snprintf(out, sizeof out, "%s.pgm", zp);
+                        f = fopen(out, "wb");
+                        if (f) {
+                            fprintf(f, "P5\n%u %u\n65535\n", sd.Width, sd.Height);
+                            for (yy = 0; yy < sd.Height; yy++)
+                                for (xx = 0; xx < sd.Width; xx++) {
+                                    uint16_t v = ((const uint16_t *)((const uint8_t *)m.pData + yy * m.RowPitch))[xx * 4];
+                                    fputc(v >> 8, f); fputc(v & 0xFF, f);
+                                }
+                            fclose(f);
+                        }
+                        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)stg, 0);
+                        fprintf(stderr, "[D3D11] depth view %08X %ux%u dumped to %s (flip %llu, after b%llu)\n", z->va,
+                                sd.Width, sd.Height, out, (unsigned long long)s_flip_count,
+                                (unsigned long long)s_draws_this_flip);
+                    }
+                    ID3D11Texture2D_Release(stg);
+                }
+            }
+        }
+    }
     return z->view_srv;
 }
 
@@ -1626,14 +1715,27 @@ static ID3D11DepthStencilState *get_ds(const Nv2aRenderState *rs, int has_depth)
 /* depth_clip: the GPU clips at the near plane (vertex programs run on the GPU,
  * so nobody else does); off for CPU-transformed vertices, which are clipped
  * already. */
+static int poly_offset(const Nv2aRenderState *rs, float *units, float *factor);
+
 static ID3D11RasterizerState *get_rast(const Nv2aRenderState *rs, int depth_clip)
 {
     uint32_t key[12] = { rs->cull_enable, rs->cull_face, rs->front_face, 3, (uint32_t)depth_clip };
-    ID3D11RasterizerState *r = (ID3D11RasterizerState *)state_lookup(s_rast, s_rast_n, key);
+    ID3D11RasterizerState *r;
     D3D11_RASTERIZER_DESC d;
+    float pu = 0.0f, pf = 0.0f;
 
+    if (poly_offset(rs, &pu, &pf)) {
+        memcpy(&key[5], &pu, 4);
+        memcpy(&key[6], &pf, 4);
+    }
+    r = (ID3D11RasterizerState *)state_lookup(s_rast, s_rast_n, key);
     if (r) return r;
     memset(&d, 0, sizeof d);
+    /* Polygon offset of a z-buffered draw (a w-buffered one applies it in PSW: the shader
+     * writes its depth, and the rasterizer's bias does not apply to that). The depth
+     * buffer is D24, so one step of bias is 2^-24. */
+    d.DepthBias = (INT)floorf(pu * 16777216.0f + 0.5f);
+    d.SlopeScaledDepthBias = pf;
     d.FillMode = D3D11_FILL_SOLID;
     d.DepthClipEnable = depth_clip ? TRUE : FALSE;
     d.ScissorEnable = TRUE;         /* the surface clip rectangle, set per draw */
@@ -1650,21 +1752,41 @@ static ID3D11RasterizerState *get_rast(const Nv2aRenderState *rs, int depth_clip
 
 static ID3D11SamplerState *get_sampler(const Nv2aTexture *t)
 {
-    uint32_t key[12] = { t->addr_u, t->addr_v, t->filter, t->levels, 4 };
-    ID3D11SamplerState *s = (ID3D11SamplerState *)state_lookup(s_samp, s_samp_n, key);
+    /* Border addressing (4) reads SET_TEXTURE_BORDER_COLOR when FORMAT's border source
+     * selects the colour, as the executor's software path does (nv2a_pb_exec.c); with the
+     * source "texture" it clamps. D3D11's default border is transparent black, which a
+     * shadow-map compare reads as the nearest depth: PGR2's car shadow receiver projects
+     * past its 1024x1024 map with border FFFFFFFF (far), and black there shadowed two big
+     * wedges of road (NOTES 15). RECOMP_D3D11_BORDER=0: black border for every addr 4. */
+    static int bc = -1;
+    uint32_t bsrc, bcol;
+    uint32_t key[12];
+    ID3D11SamplerState *s;
     D3D11_SAMPLER_DESC d;
     uint32_t minf = (t->filter >> 16) & 0xFF, magf = (t->filter >> 24) & 0xF;
     int nearest = !(magf == 2 || minf == 2 || minf >= 4);
     int au = t->addr_u, av = t->addr_v;
 
+    if (bc < 0) { const char *e = getenv("RECOMP_D3D11_BORDER"); bc = !(e && e[0] == '0'); }
+    bsrc = bc ? (t->border_color ? 1u : 2u) : 0u;      /* 1 colour, 2 clamp, 0 black (old) */
+    bcol = bsrc == 1u ? t->border : 0u;
+    memset(key, 0, sizeof key);
+    key[0] = t->addr_u; key[1] = t->addr_v; key[2] = t->filter; key[3] = t->levels; key[4] = 4;
+    key[5] = (au == 4 || av == 4) ? bsrc : 0u; key[6] = (au == 4 || av == 4) ? bcol : 0u;
+    s = (ID3D11SamplerState *)state_lookup(s_samp, s_samp_n, key);
     if (s) return s;
     memset(&d, 0, sizeof d);
     d.Filter = nearest ? D3D11_FILTER_MIN_MAG_MIP_POINT : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    if (bsrc == 2u) { if (au == 4) au = 3; if (av == 4) av = 3; }
     d.AddressU = au == 1 ? D3D11_TEXTURE_ADDRESS_WRAP : au == 2 ? D3D11_TEXTURE_ADDRESS_MIRROR
                : au == 4 ? D3D11_TEXTURE_ADDRESS_BORDER : D3D11_TEXTURE_ADDRESS_CLAMP;
     d.AddressV = av == 1 ? D3D11_TEXTURE_ADDRESS_WRAP : av == 2 ? D3D11_TEXTURE_ADDRESS_MIRROR
                : av == 4 ? D3D11_TEXTURE_ADDRESS_BORDER : D3D11_TEXTURE_ADDRESS_CLAMP;
     d.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    d.BorderColor[0] = (float)((bcol >> 16) & 0xFF) / 255.0f;
+    d.BorderColor[1] = (float)((bcol >> 8) & 0xFF) / 255.0f;
+    d.BorderColor[2] = (float)(bcol & 0xFF) / 255.0f;
+    d.BorderColor[3] = (float)(bcol >> 24) / 255.0f;
     d.MaxLOD = (t->levels > 1 && minf >= 3) ? D3D11_FLOAT32_MAX : 0.0f;
     d.MaxAnisotropy = 1;
     d.ComparisonFunc = D3D11_COMPARISON_NEVER;
@@ -1684,6 +1806,26 @@ static int wbuffer_on(const Nv2aRenderState *rs)
     static int on = -1;
     if (on < 0) { const char *e = getenv("RECOMP_D3D11_WBUFFER"); on = !(e && e[0] == '0'); }
     return on && s_psw && (rs->control0 & 0x00010000u) != 0;
+}
+
+/* Polygon offset (SET_POLY_OFFSET_FILL_ENABLE, SET_POLYGON_OFFSET_SCALE_FACTOR / _BIAS;
+ * NOTES 15): a filled triangle's depth moves by units depth-buffer steps plus factor x
+ * its largest depth slope per guest pixel before the test, as in xemu (depthOffset +
+ * depthFactor x triMZ). PGR2 draws road decals coplanar with the road and pulls them
+ * forward with -0.25 / -1; without the offset they z-fight with the road under them in
+ * large straight-edged patches. It pushes its car shadow map back with 8 / 128.
+ * Returns 1 with units in normalised depth and factor per host pixel (the internal
+ * resolution is s_res x the guest's). RECOMP_D3D11_POLYOFFSET=0: off. */
+static float depth_scale(const Nv2aRenderState *rs);
+static int poly_offset(const Nv2aRenderState *rs, float *units, float *factor)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("RECOMP_D3D11_POLYOFFSET"); on = !(e && e[0] == '0'); }
+    if (!on || !rs->poly_offset_fill || (rs->poly_offset_units == 0.0f && rs->poly_offset_factor == 0.0f))
+        return 0;
+    *units = rs->poly_offset_units * depth_scale(rs);
+    *factor = rs->poly_offset_factor * (float)s_res;
+    return 1;
 }
 
 /* Depth (z, or w when w-buffered) is stored relative to the depth buffer's full scale,
@@ -3244,6 +3386,8 @@ vertices_ready:
             cb.zclip[2] = 1.0f;
         }
         cb.zclip[3] = wbuffer_on(rs) ? 1.0f : 0.0f;
+        if (wbuffer_on(rs))
+            poly_offset(rs, &cb.poffs[0], &cb.poffs[1]);
     }
     {
         static int dbg = -1;
@@ -3252,7 +3396,10 @@ vertices_ready:
         {
             /* RECOMP_D3D11_DBGFILE=<path>: "<mode> [<vsh hash hex>]" read every 30 flips; the debug view
              * (modes as RECOMP_D3D11_DBG: 1 d0, 3 d1, 7 d0.a, 9 d1.a, 10-13 stage rgb, 14-17 stage alpha,
-             * 18 t2 direction) for that vertex programme's draws only, or all with no hash. */
+             * 18 t2 direction; 19 a flat colour per batch index, as 8 does per programme -- which
+             * batch wrote a pixel; 20 the shadow stage's stored depth, r/q and flags (b 1: q < 0), 21 the
+             * compare margin 0.5 + (d - r)*256, unblended) for that vertex programme's draws only, or all
+             * with no hash. */
             static const char *path = (const char *)1;
             static uint64_t read_at;
             static uint32_t fmode, fhash;
@@ -3266,6 +3413,7 @@ vertices_ready:
             if (fmode && (!fhash || fhash == x->vsh_hash)) cb.dbg[0] = fmode;
         }
         cb.dbg[1] = x->vsh_hash;
+        if (cb.dbg[0] == 19u) { cb.dbg[0] = 8u; cb.dbg[1] = (uint32_t)s_draws_this_flip; }
         {
             /* The title toggles SET_SPECULAR_ENABLE per draw; off, the combiners see no specular.
              * Honouring it blacks out the sky and buildings (they run with it off), so it is opt-in:
@@ -3364,6 +3512,30 @@ vertices_ready:
                 if (s_zb[k].view_wide && s_zb[k].view_srv && s_zb[k].view_srv == srvs[st])
                     cb.stage_scale[st][2] = (float)s_res;
             cb.stage_valid[st] = 1;
+            {
+                /* SET_TEXTURE_CONTROL0 ALPHA_KILL_ENABLE (NOTES 15): a texel with alpha 0
+                 * discards the pixel. PGR2's car shadow receiver relies on it: its colour is
+                 * a constant 0.37 multiplied into the scene, and the shadow-map compare (0 or 1
+                 * in every channel) kills it wherever the car does not shade the ground.
+                 * RECOMP_D3D11_ALPHAKILL=0: off. */
+                static int ak = -1;
+                if (ak < 0) { const char *e = getenv("RECOMP_D3D11_ALPHAKILL"); ak = !(e && e[0] == '0'); }
+                if (ak && si->alpha_kill)
+                    cb.akill[0] |= 1u << st;
+            }
+            {
+                /* A depth-format texture in a projective stage is a shadow-map compare
+                 * (shadow_fetch; NOTES 15). PGR2's car shadow receivers multiply the scene
+                 * by it; read as a plain colour, the raw depth darkened every road piece
+                 * near the car. RECOMP_D3D11_SHADOWCMP=0: plain sample as before; =2 (diagnostic) swaps the operands. */
+                static int scmp = -1;
+                uint32_t c = si->tex.color;
+                if (scmp < 0) { const char *e = getenv("RECOMP_D3D11_SHADOWCMP"); scmp = e ? atoi(e) : 1; }
+                if (scmp && c >= 0x2A && c <= 0x31)
+                    cb.shadow[st] = 8u | (rs->shadow_func & 7u) | (scmp == 2 ? 64u : 0u)
+                                  | ((c == 0x2A || c == 0x2B || c == 0x2E || c == 0x2F) ? 1u << 4
+                                     : (c == 0x2D || c == 0x31) ? 2u << 4 : 0u);
+            }
             {
                 /* Experiment: RECOMP_D3D11_Y8INV=1 reads a rendered surface sampled as Y8 inverted. */
                 static int inv = -1;
@@ -3530,7 +3702,11 @@ no_atest:
             static int mb = -1;
             Nv2aRenderState rb;
             if (mb < 0) { const char *e = getenv("RECOMP_D3D11_MASKBLEND"); mb = e && e[0] == '1'; }
-            if (mb && x->vsh_hash == 0xC8AF571Fu && s->bytes_per_pixel == 1 && x->vsh && !x->vsh->fog_enable
+            if ((cb.dbg[0] == 20u || cb.dbg[0] == 21u) && rs->blend_enable) {
+                rb = *rs;                               /* shadow debug views: write, don't blend */
+                rb.blend_enable = 0;
+                sc_blend(get_blend(&rb), bf);
+            } else if (mb && x->vsh_hash == 0xC8AF571Fu && s->bytes_per_pixel == 1 && x->vsh && !x->vsh->fog_enable
                 && !rs->blend_enable) {
                 rb = *rs;
                 rb.blend_enable = 1;
