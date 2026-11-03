@@ -1103,7 +1103,7 @@ index 327f01d..a71e7c7 100644
 +
  #endif /* NV2A_BACKEND_H */
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index a513bc7..b279d6b 100644
+index a513bc7..4017beb 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -305,6 +305,10 @@ static struct {
@@ -2252,7 +2252,7 @@ index a513bc7..b279d6b 100644
 +                    fprintf(stderr, "[VTRACE]   constants differing from the game's shadow: %u of %u\n", bad,
 +                            (unsigned)NV2A_VSH_CONSTANTS);
 +                }
-+            }
+             }
 +            {
 +                uint32_t nz = 0, tot = n < 400 ? n : 400, k;
 +                for (k = 0; k < tot; k++) {
@@ -2292,7 +2292,7 @@ index a513bc7..b279d6b 100644
 +                fprintf(stderr, "[VTRACE]   v3 nonzero in %u of %u vertices; out0 d0 %g %g %g %g d1 %g %g %g\n",
 +                        nz, tot, s_xf[0].d0[0], s_xf[0].d0[1], s_xf[0].d0[2], s_xf[0].d0[3],
 +                        s_xf[0].d1[0], s_xf[0].d1[1], s_xf[0].d1[2]);
-             }
++            }
 +            fprintf(stderr, "[VTRACE]   fog enable %u mode 0x%X param %g %g color %08X; vert0 oFog %g %g %g %g -> factor %g\n",
 +                    s_gpu.fog_enable, s_gpu.fog_mode, s_gpu.fog_param[0], s_gpu.fog_param[1], s_gpu.fog_color,
 +                    s_xf[0].fog[0], s_xf[0].fog[1], s_xf[0].fog[2], s_xf[0].fog[3], fog_factor(s_xf[0].fog[0]));
@@ -2366,7 +2366,22 @@ index a513bc7..b279d6b 100644
      s_gpu.verts += s_gpu.idx_count;
  
      /* How many batches carry coordinates at all, and what range they span.
-@@ -3402,6 +4363,9 @@ static void draw_inline_array(void)
+@@ -3284,7 +4245,13 @@ static void draw_primitive(void)
+         }
+     }
+ 
+-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
++    /* Read once: this runs for every draw, and the CRT's getenv scans the whole
++     * environment under a lock. Uncached it was ~20% of the executor thread in a
++     * PGR2 race at 60 fps, ~4000 draws a frame (pgr2recomp NOTES 21). */
++    static int verbose = -1;
++    if (verbose < 0)
++        verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
++    if (verbose) {
+         static int shown;
+         if (shown++ < 6) {
+             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
+@@ -3402,6 +4369,9 @@ static void draw_inline_array(void)
          case 0:  bytes = 4;                        break;  /* D3DCOLOR   */
          case 2:  bytes = 4 * s_gpu.attr[a].size;   break;  /* float      */
          case 4:  bytes = s_gpu.attr[a].size;       break;  /* ubyte norm */
@@ -2376,7 +2391,7 @@ index a513bc7..b279d6b 100644
          default: bytes = 4 * s_gpu.attr[a].size;   break;
          }
          s_gpu.attr[a].offset = off;
-@@ -3445,6 +4409,10 @@ out:
+@@ -3445,6 +4415,10 @@ out:
   * carries and what this rasteriser samples; a second texcoord set or a normal
   * would need the D3D11 translator, not more slots here.
   */
@@ -2387,7 +2402,7 @@ index a513bc7..b279d6b 100644
  static void draw_immediate(void)
  {
      VertexAttr saved[NV_VERTEX_ATTRS];
-@@ -3473,6 +4441,19 @@ static void draw_immediate(void)
+@@ -3473,6 +4447,19 @@ static void draw_immediate(void)
  
      /* fetch_attr bounds-checks against inline_count dwords. */
      s_gpu.inline_count = s_gpu.imm_count * IMM_VERTEX_DWORDS;
@@ -2407,7 +2422,7 @@ index a513bc7..b279d6b 100644
      s_gpu.inline_active = 1;
      draw_primitive();
      s_gpu.inline_active = 0;
-@@ -3511,6 +4492,11 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
+@@ -3511,6 +4498,11 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
      uint32_t attr, c;
      float *a;
      v.u = param;
@@ -2419,7 +2434,7 @@ index a513bc7..b279d6b 100644
  
      if (method >= NV097_SET_VERTEX4F && method < NV097_SET_VERTEX4F + 16) {
          c = (method - NV097_SET_VERTEX4F) / 4;
-@@ -3912,9 +4898,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3912,9 +4904,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          s_gpu.rc_seen = 1;
          break;
      case 0x1E70: s_gpu.rc.stage_program = param; break;
@@ -2432,7 +2447,7 @@ index a513bc7..b279d6b 100644
      case 0x0300: s_gpu.alpha_test = param; break;
      case 0x033C: s_gpu.alpha_func = param; break;
      case 0x0340: s_gpu.alpha_ref = param; break;
-@@ -3924,9 +4913,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3924,9 +4919,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
      case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
      case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
@@ -2452,7 +2467,7 @@ index a513bc7..b279d6b 100644
          s_gpu.zpass_enable = param;
          break;
      case 0x17D0: {                                /* GET_REPORT */
-@@ -3937,12 +4936,25 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3937,12 +4942,25 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
           * 3 culls its world with these, so the race's main view drew only
           * the sky while the cube-map passes, which do not test, drew it all.
           * The report DMA object starts at physical 0 here, as D3D sets it. */
@@ -2482,7 +2497,7 @@ index a513bc7..b279d6b 100644
          break;
      }
      case NV097_SET_BLEND_COLOR:
-@@ -4130,6 +5142,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4130,6 +5148,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              }
          }
          s_gpu.drawn_stale = 1;

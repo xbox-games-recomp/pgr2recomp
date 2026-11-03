@@ -14,6 +14,8 @@ PATCHES=[
  ('void sub_001F0311(void)\n{', 'void sub_001F0311_gen(void)\n{'),
  # RECOMP_TEST_SUSPEND_RACE_MS (test only, NOTES 17)
  ('void sub_0018F419(void)\n{', 'void sub_0018F419_gen(void)\n{'),
+ # RECOMP_PRESENT_INTERVAL (NOTES 18): recomp_manual.c wraps the game's SetPresentInterval.
+ ('void sub_00177C70(void)\n{', 'void sub_00177C70_gen(void)\n{'),
 ]
 files=sorted(glob.glob(GEN+'recomp_*.c'))
 ok=True

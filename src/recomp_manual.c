@@ -533,6 +533,31 @@ void sub_0018F419(void)
     sub_0018F419_gen();
 }
 
+/*
+ * The game's SetPresentInterval (renderer 0x485DD0, thiscall, one stack arg: 0 immediate, 1, 2;
+ * stores it in [this+0x321] = 0x4860F1 and D3D's interval global 0x1D093C). Races pass the
+ * PresentInterval setting [0x291A04], which Frontend\Frontend.ini sets to 2 ("Set to 2 to run at
+ * 30fps"); menus and movies pass 1. The game derives its time step from [0x4860F1]:
+ * interval / refresh ([0x48614B] = 60), so a race asked for interval 1 steps 1/60 s per frame and
+ * runs at 60 fps in real time (NOTES 18). RECOMP_PRESENT_INTERVAL=1 turns a request for 2 into 1;
+ * unset or 2 keeps the console's 30 fps.
+ */
+extern void sub_00177C70_gen(void);
+
+void sub_00177C70(void)
+{
+    static int iv = -1;
+    if (iv < 0) {
+        const char *e = getenv("RECOMP_PRESENT_INTERVAL");
+        iv = e && *e >= '1' && *e <= '2' ? *e - '0' : 2;
+        if (iv != 2)
+            fprintf(stderr, "  [PGR2] races present at interval %d (RECOMP_PRESENT_INTERVAL)\n", iv);
+    }
+    if (iv != 2 && MEM32(g_esp + 4) == 2u)
+        MEM32(g_esp + 4) = (uint32_t)iv;
+    sub_00177C70_gen();
+}
+
 #if 0 /* RSC2 reference (XDK 5849, RSC2 guest addresses; re-locate before use) */
 /* Device pointer global of the XDK 5849 D3D (g_pDevice). */
 #define RSC2_D3D_DEVICE 0x00375418u

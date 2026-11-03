@@ -587,7 +587,154 @@ stays a list; 2 logs only; 0 is off. A drain that finds a broken link logs `[DSL
 Silent so far: the user's KeQuerySystemTime spin (the self-linked node) has not recurred, so its cause is still
 open; the next one names its inserter.
 
+## 18. 60 fps races at real-time speed: the game's own PresentInterval (`RECOMP_PRESENT_INTERVAL=1`)
+
+Races run at 30 fps because the title asks for presentation interval 2 (13). It is a setting, not an assumption:
+`Frontend\Frontend.ini` has `PresentInterval = 2 ; Set to 2 to run at 30fps`, parsed by `sub_0014B060` into
+`[0x291A04]` (UTF-16 key at `0x27ED78`; `DemoVersion`, `[0x291969]`, forces 2). The race calls the game's
+SetPresentInterval `sub_00177C70` (renderer `0x485DD0`, thiscall, one arg: 0 immediate, 1, 2) with it from
+`sub_000EBD20` / `sub_000F5A30` / `sub_000F5BC0`; menus and movies pass 1. It stores the interval in
+`[0x4860F1]` (`this+0x321`) and D3D's swap global `[0x1D093C]` (flags 1/2/4, read by D3D's Swap `sub_001C5480`
+into the swap NOP that the flip hold of 13 decodes). The time step comes from the same byte: every timing
+user (`sub_000179F0`, `sub_0004C180`, `sub_0004DB20`, `sub_000820F0` = the physics step via `sub_00017450`,
+`sub_000D9060` / `sub_000D90F0`, `sub_000EFE00` = the lap/second counter, `sub_0011DEB0`, `sub_001BF350`)
+computes `interval / refresh` with the refresh rate `[0x48614B]` (60; set in `sub_001783A0`). So interval 1
+steps 1/60 s per frame, and nothing needs scaling.
+
+Knob: `RECOMP_PRESENT_INTERVAL=1` (`src\recomp_manual.c` wraps `sub_00177C70`; `scripts\patch_gen.py` renames
+the generated one to `*_gen`) turns a request for 2 into 1 and logs `[PGR2] races present at interval 1`. Unset
+or `2` = console behaviour. Launcher: Graphics -> Race frame rate (default 30 fps). Not default-on: see below.
+Needs `RECOMP_VBLANK` + `RECOMP_FLIP_PACING=1` as before (they cap it at 60).
+
+Measured (Florence grid, `to_carselect.ps1 -race -drive 0`, then 15 s of full throttle into the first wall;
+frame dumps every second, HUD read from the dumps; race state `[0x39B320]` sampled with cdb `-pv`):
+
+| run | setting | flips/s while racing | lap clock per wall s | mph at lap clock 0.9 / 1.9 / 2.9 / 3.9 / 4.9 / 5.9 / 7.9 s | hits the wall |
+|---|---|---|---|---|---|
+| pi2 | 2 (30 fps), vsync on | 30 every second | 1.000 (HUD) ; 5634 ms / 5.993 s incl. a cdb pause | 47 / 55 / 62 / 64 / 70 / 76 / 81 | 7.9-8.9 s |
+| pi1 | 1 by cdb poke of `[0x291A04]` at the title, vsync on | ~56 | 5666 ms / 6.016 s incl. a cdb pause | (interpolated) 46 / 55 / 62 / 66 / 70 / 73 / 81 | 8.3-9.2 s |
+| kn1 | knob, vsync on | 54-59 | 0.92-0.98 (HUD) | 43@0.5 / 50@1.4 / 58@2.3 / 64@3.3 / 66@4.2 / 71@5.1 / 80@8.1 | 8.1-8.9 s |
+| kn2 | knob, vsync off (`RECOMP_D3D11_VSYNC=0`) | 60 every second (one 48) | 1.000 (HUD, 0.887, 1.887, ... 23.704) | 46 / 54 / 62 / 64 / 70 / 76 / 80 | 7.9-8.9 s |
+
+Speed against game time is the same within 1-2 mph (gear-change instants differ by a frame), and the car reaches
+the same wall at the same game time, so distance per second is unchanged. The game clock matches wall time
+exactly as long as 60 flips/s are held: with host vsync on (kn1), the host's present blocks on the monitor's
+vsync while the flip hold waits for the toolkit's own 60 Hz guest vblank, the two beat, frames drop to 54-59,
+and the race runs that much slow (each frame is still 1/60 s). At 30 fps there is a whole vblank of slack, so
+vsync on is harmless there. (Correction, 19: the monitor here is 165 Hz, so it is not a beat. The test scripts
+start the game with a hidden window, which throttles `Present(1)`, and the old blt-model swap chain blocked the
+walker on every present. The flip-model swap chain of 19 holds 60 with vsync on.) Default stays 30 until replays
+and a full race are checked at 60.
+Not checked: AI over a full race, replays (recorded at the race's frame rate?), the race finish / kudos path,
+engine audio pitch (by ear), split-screen. Not possible this way: above 60 (interval 0 = immediate is treated
+as 1, so it would step 1/60 per flip at any rate; raising `[0x48614B]` with a faster guest vblank is untried,
+and several paths use the constant 1/60 `[0x275D1C]` directly).
+
+## 19. Vsync on cost frames: flip-model swap chain (`RECOMP_D3D11_SWAP=blt` reverts)
+
+18's vsync-on run (kn1) reached 54-59 flips/s. Two causes. The test scripts start the game with
+`-WindowStyle Hidden`, so its window is hidden and DXGI throttles its vsync'd presents; with a visible window
+(run vs1, scratch copy of `live.ps1` with `-WindowStyle Normal`) the race held 60 most seconds. That still left
+dips to 37-45 flips/s at the start of the throttle run: `RECOMP_D3D11_HITCH=20` showed every frame there at
+21-28 ms, where the vsync-off run kn2 held 60. The back end presented with a two-buffer blt-model (`DISCARD`)
+chain, whose `Present(1)` blocks the presenting thread, the GPU walker, until the monitor's next refresh, on
+top of the flip hold's wait for the guest vblank (13). The host monitor is 165 Hz, so it is not a beat
+between two 60 Hz clocks: the waits add up.
+
+Fix (`src\d3d11_backend.c`, game-side, no toolkit change): a three-buffer `DXGI_SWAP_EFFECT_FLIP_DISCARD`
+chain. A vsync'd present then queues the frame and returns. The back buffer is cleared before every
+present's draw, so discard semantics are safe. ResizeBuffers keeps count/flags (0), and buffer 0 is always the
+current back buffer in D3D11. Logged at startup: `[D3D11] swap chain: flip model, 3 buffers, vsync on`. If it
+cannot be created, it falls back to blt. `RECOMP_D3D11_SWAP=blt` restores the old chain. Default on.
+
+Measured (visible window, vsync on, 165 Hz monitor, `to_carselect.ps1 -race -drive 15000`, per-second dumps):
+
+| run | chain | interval | race flips/s | lap clock per wall s (HUD) | mph at 0.2 / 1.2 / 2.2 / 3.2 / 4.2 / 5.2 / 7.2 / 8.2 s |
+|---|---|---|---|---|---|
+| vs1 | blt | 1 | 37, 38, 45 at the start, else ~60; 173 frames over 20 ms | -- | -- |
+| vs2 | flip | 1 | 60 every second except 57, 46 at the crash; 108 frames over 20 ms | 1.000 (0.154, 1.154, ... 8.154; 23.854) | 40 / 49 / 57 / 64 / 66 / 71 / 77 / 82 |
+| vs3 | flip | 2 (default) | 30 every second | 1.000 (0.154 ... 22.137) | 40 / 49 / 57 / 64 / 66 / 71 / 77 / 82 |
+
+At 60 fps the front end, menus and car selection hold 59-61 flips/s with the flip model. With blt in the same
+visible run, some stretches ran at 25. The intro movies (Intro1-3, English, pbg, title_new3) give the same
+frames at the same seconds in pi2 (hidden, blt), vs1 and vs2 up to 36 s; later differences follow where the
+scripted Start presses land. The one remaining dip (vs2 s262-263) is the crash into the wall: draws per frame
+rise from ~2000 to ~3870 (debris and smoke), and each frame takes ~21 ms. That is draw throughput, unrelated
+to presenting; kn2 (vsync off) dips at the same point. At 60 fps such a moment runs the race slow by that
+much: the HUD clock gained 0.95 and 0.77 s over those two seconds.
+
+## 20. A full race and its replay at 60 fps
+
+Scratch script (visible window, vsync on, flip model): the Florence street race with the player parked at the
+grid while the three AI cars race their 2 laps. After 140 s, read the AI race states (`0x39B320 + k*0x2498`,
+k = 1..3: `+0x10` laps, `+0x14` lap index, `+0x40` lap timer, `+0x44` total race time ms, `+0x48` best lap ms).
+Then finish with the lap poke of 17 plus throttle, and open Results -> View or Save Replay (right, right, A).
+
+AI results are **identical to the millisecond** at 30 and 60 fps (runs fr30, fr60, fs60): Seat Leon 111.338 s
+(best lap 49.116), MINI 117.355 (52.933), Beetle 122.338 (55.983), and the same values in the
+`+0x4C`/`+0x50` split fields. The results screen shows 1:51.338 / +0:06.017 / +0:11.000 in all three. So the AI
+simulation is unaffected by the step size, at least on this race.
+
+Replay: it plays at 60 flips/s (59-61 every second for 3 minutes; one 45) and in real time. The parked
+player's car pulls away 183 s after the replay's green light in both fs60 and fr30, against 184.6 s and 183.9 s
+on the race clock (dumps resolve 1 s). A 5:08 race (lr60) replays from the grid with the full countdown, so the
+replay buffer does not run out at 60 fps on a race that long. One hand-driven run (fr60: retry screen, B back to
+the results, then the replay) started the replay later than the green light and came out 5 s short. Not seen on
+the scripted path; not investigated.
+
+Not covered: a race the player drives to the finish (no steering in the scripts), other cities and modes
+(time attack ghosts, `GhostName2`), split screen. Remaining reason for keeping 30 as the default: at 60 every
+dropped frame slows the game (19's crash moment: 46 flips/s on an RTX 4080 at 2x), where 30 has a whole vblank of
+slack. A 60 Hz monitor is also untested: the guest's vblank runs on the performance counter, not the display, so
+the flip queue would fill now and then and drop a frame.
+
+## 21. Profiling the executor thread: a getenv per draw (fixed in the toolkit), a state cache
+
+Tool: the existing sampler `src\sampler.c` (`RECOMP_SAMPLE=exec`: suspends the thread that executes the push
+buffer and flips every 1 ms, unwinds, splits samples by `RECOMP_SAMPLE_SLOW_MS`; `RECOMP_SAMPLE_SKIP=<s>` drops
+boot and menus, `RECOMP_SAMPLE_SECS` sets the report interval). New here: names outside the exe carry their
+module (`ucrtbase!strchr`). Without a PDB a system DLL's address takes the nearest export's name, which is how
+this first read as the driver. `_NT_SYMBOL_PATH=srv*C:\ProgramData\dbg\sym` uses the local symbol cache (no
+download). Kernel ETW sampling (xperf/WPR) needs an elevated shell, which this session does not have. Runs:
+60 fps, visible window, vsync on, `to_carselect.ps1 -race -drive 15000` (full throttle into the first wall at
+~8.5 s), `RECOMP_SAMPLE_SLOW_MS=19`, `RECOMP_SAMPLE_SKIP=240`.
+
+Before (sx1), the executor thread (`nv2a_ack_thread`) was busy 85% of normal 60 fps frames and 90% of slow ones.
+`nv2a_pb_exec_method` was 75% inclusive in slow frames: `draw_primitive` 58%, `raster_batch_vsh_gpu` 33%,
+`be_draw_ext` 23%, and **`ucrtbase!strchr` 24%**. The culprit: `draw_primitive` (toolkit `nv2a_pb_exec.c`)
+called `getenv("RECOMP_PB_EXEC_VERBOSE")` on every draw. The CRT's getenv walks the whole environment (the
+launcher's is large) under a lock, ~4000 times a frame. Now read once (toolkit, `patches\xboxrecomp.patch`
+refreshed; behaviour unchanged, so no knob).
+
+Also added (`src\d3d11_backend.c`): a bound-state cache on the draw path (`sc_*` wrappers). Each draw re-bound
+~15 pieces of state (render target twice); 84% of those calls are now skipped
+(`[D3D11] state cache: N calls issued, M skipped` every 1800 flips). Rules: depth_view's blit, present_frame and
+resize_swap reset it; a real render-target change forgets the cached SRVs (D3D11 unbinds an SRV of the new
+target). `RECOMP_D3D11_STATECACHE=0` issues every call. Default on.
+
+| run | getenv fix | state cache | frames > 19 ms in the race | executor idle in normal frames (sleep / flip-wait polling) | flips/s through the crash |
+|---|---|---|---|---|---|
+| sx1 | no | no | 146 | 14.7% / ~10% | 60 (dips elsewhere) |
+| sx2 | no | yes | 150 | 17.9% / ~10% | 54, 36, 47 |
+| sx5 | yes | no | 75 | 27.3% / 17.2% | 60, 56, 59 |
+| sx4 | yes | yes | 66 | 27.3% / 17.7% | 60 every second |
+
+So the getenv was the big one: the executor now has ~45% headroom at 60 fps. The state cache adds ~2% of the
+thread (`be_draw_ext` 17.5% vs 19.5% inclusive) and fewer dips. The remaining slow frames include the
+once-a-second frame dump the scripts take (~20 ms each). Rendering is unchanged: the grid frame (second 240)
+differs between cache on and off by a mean of 0.04-0.07 levels (0.04-0.07% of pixels by more than 16), the
+same as two cache-off runs. Race frames look the same.
+
+Side notes. One sampler run with the symbol path (sx3) exited during its first report, right after
+`[IRQ] wait: vblank pending 4450 ms`; sx4 with the same settings did not. A noninvasive cdb (`-pv`) that aborts
+before `q` leaves every thread suspended (the game "hangs" in whatever it was doing; `Suspend: 2` on every
+thread in `~*`): not a game bug.
+
 ## Next
+
+-1. 60 fps (18-21): holds 60 with vsync on, now including the crash moment, with ~45% executor headroom.
+   AI, results and replay check out at 60. Default stays 30 (the user's call, 2026-11-02). Test runs: the scripts start the game with a hidden window, which
+   throttles vsync'd presents; frame-rate measurements need a visible window or vsync off.
 
 0. Sunlit road (15): the hardware rule behind `FOGW` + `MASKBLEND` -- needs the user's xemu RenderDoc capture of
    the plaza (`807D8000` after b612-b614, a near-road pixel's T3 sample).
@@ -596,5 +743,5 @@ open; the next one names its inserter.
 2. The user drives a full race (window, input feel, audio); the black player car (xemu shader cache comparison).
 3. More CRT x87 entries may surface as `[ICALL] Failed 0x001B5xxx/0x001B9xxx`: seed the table entry / stub
    target (10). SEH handlers referenced from `.rdata` (`0x001B2F48`, `0x001B85D9`, ...) are not seeded.
-4. The toolkit fixes in 7 and 14 (narrow mul/div) are game-agnostic: carry them to rsc2recomp/mm3recomp's patch
+4. The toolkit fixes in 7, 14 (narrow mul/div) and 21 (getenv per draw) are game-agnostic: carry them to rsc2recomp/mm3recomp's patch
    when convenient (14 especially: any `imul r/m8` there is mis-lifted too).

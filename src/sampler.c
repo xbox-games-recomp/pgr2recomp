@@ -64,7 +64,17 @@ static void name_of(DWORD64 a, char *out, size_t n)
     memset(buf, 0, sizeof buf);
     si->SizeOfStruct = sizeof(SYMBOL_INFO);
     si->MaxNameLen = 255;
-    if (a && SymFromAddr(GetCurrentProcess(), a, &disp, si))
+    IMAGEHLP_MODULE64 mi;
+    memset(&mi, 0, sizeof mi);
+    mi.SizeOfStruct = sizeof mi;
+    /* Outside the exe, prefix the module: without its PDB a system DLL's address takes the
+     * nearest export's name (the NVIDIA driver's code read as ntdll!strchr). */
+    if (a && SymGetModuleInfo64(GetCurrentProcess(), a, &mi) && _stricmp(mi.ModuleName, "pgr2_recomp")) {
+        if (SymFromAddr(GetCurrentProcess(), a, &disp, si))
+            snprintf(out, n, "%s!%s", mi.ModuleName, si->Name);
+        else
+            snprintf(out, n, "%s!+%llx", mi.ModuleName, (unsigned long long)(a - mi.BaseOfImage));
+    } else if (a && SymFromAddr(GetCurrentProcess(), a, &disp, si))
         snprintf(out, n, "%s", si->Name);
     else
         snprintf(out, n, "%p", (void *)a);
