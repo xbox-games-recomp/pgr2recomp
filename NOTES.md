@@ -819,6 +819,17 @@ Side notes. One sampler run with the symbol path (sx3) exited during its first r
 before `q` leaves every thread suspended (the game "hangs" in whatever it was doing; `Suspend: 2` on every
 thread in `~*`): not a game bug.
 
+## 22. Circuit maps cut off: the immediate-vertex store held 1024 vertices (fixed in the toolkit)
+
+The circuit map (event select, Time Attack circuit select, the race HUD) showed only the start of the track.
+The game renders each map into a 64x64 A8R8G8B8 render target (`80EF7000`/`80EFB000` at event select,
+`RECOMP_D3D11_TEXWHY=1` says so) as five passes of one QUADS batch each, with the vertices sent as SET_VERTEX
+methods (immediate mode), not a vertex buffer. The executor keeps an immediate vertex as all 16 attributes
+(64 dwords) in `inline_buf`, which was 65536 dwords: 1024 vertices, the rest of the batch dropped silently.
+Florence Duomo 2 is 1856 vertices a pass. `NV_MAX_INLINE` is now 1M dwords (4 MB static, 16384 immediate
+vertices) and hitting the cap logs `[GPU] immediate batch over N vertices` once. Verified at event select
+(closed circuit) and in the race HUD map. Port to rsc2/mm3's patch: the same cap is there.
+
 ## Next
 
 -1. 60 fps (18-21): holds 60 with vsync on, now including the crash moment, with ~45% executor headroom.
