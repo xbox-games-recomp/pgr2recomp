@@ -12,6 +12,8 @@ PATCHES=[
  ('void sub_001F0883(void)\n{', 'void sub_001F0883_gen(void)\n{'),
  ('void sub_001F028F(void)\n{', 'void sub_001F028F_gen(void)\n{'),
  ('void sub_001F0311(void)\n{', 'void sub_001F0311_gen(void)\n{'),
+ # DirectSound's release wait (RECOMP_DS_VOICEWAIT, NOTES 17)
+ ('void sub_001F30B4(void)\n{', 'void sub_001F30B4_gen(void)\n{'),
  # RECOMP_TEST_SUSPEND_RACE_MS (test only, NOTES 17)
  ('void sub_0018F419(void)\n{', 'void sub_0018F419_gen(void)\n{'),
  # RECOMP_PRESENT_INTERVAL (NOTES 18): recomp_manual.c wraps the game's SetPresentInterval.

@@ -488,6 +488,139 @@ void sub_001F0311(void)
 }
 
 /*
+ * Named busy loops (the toolkit's spin reports call this, NOTES 17). The race-end
+ * KeQuerySystemTime spin is DirectSound's wait for a released voice to go idle:
+ * sub_001F30B4 loops `while (flags & 0x8000) sub_001F289C()`, which reads the time
+ * and, 0.5 s after the release (time at +0x78, from sub_001F319E), stops the voice
+ * itself. In sub_001F289C at the KeQuerySystemTime call, [esp+8] is the voice.
+ */
+extern void __stdcall xbox_KeQuerySystemTime(void *time);
+
+/*
+ * The wait itself (patch_gen.py renames the generated one to sub_001F30B4_gen).
+ * Flags (+0x12): 0x1 voice in use, 0x8000 release pending. 0x8000 is cleared only by
+ * sub_001F25D7 (unlink), which DirectSound's idle-voice trap handler (sub_001F01B8)
+ * calls when the voice goes idle, and the timeout's Stop (sub_001F27B3) calls when
+ * 0x1 is also set. The trap handler skips a voice that is already off its list or
+ * arrives while a release is mid-flight (core+0x84), so a wait can outlive both.
+ * The user's race-end freeze (run.log 2026-11-03) is one that never ended.
+ * RECOMP_DS_VOICEWAIT: 1 (default) logs a wait still running after 2 s with the
+ * voice's state and ends it as the timeout would (Stop when 0x1 is set, then clear
+ * 0x8000); 2 logs only; 0 runs the generated loop.
+ * RECOMP_TEST_VOICEWAIT_STUCK (test only), on the main thread's stream release at
+ * the race end (0x1F41A8 under 0x13058D): 1 clears 0x1; 2 also blocks the idle
+ * trap (core+0x84) and moves the release time an hour ahead, so neither the trap
+ * nor the timeout can end it.
+ */
+extern void sub_001F30B4_gen(void);
+extern void sub_001F289C(void);
+extern void sub_001F27B3(void);
+
+static int ds_voicewait(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_DS_VOICEWAIT");
+        on = e && *e ? atoi(e) : 1;
+    }
+    return on;
+}
+
+static void ds_log_voice(const char *what, uint32_t v)
+{
+    uint32_t vblocks = MEM32(0x1F7720), i, n = MEM8(v + 0x64);
+    uint64_t now = 0, rel = ((uint64_t)MEM32(v + 0x7C) << 32) | MEM32(v + 0x78);
+    xbox_KeQuerySystemTime(&now);
+    fprintf(stderr, "  [DSWAIT] %s: object 0x%08X vtable 0x%08X flags 0x%04X/0x%04X/0x%04X, released"
+            " %lld ms ago, IRQL %u, hw voices %u (+0x65 %u), list entry %s, core 0x%08X busy %u\n",
+            what, v, MEM32(v), MEM16(v + 0x12), MEM16(v + 0x14), MEM16(v + 0x16),
+            (long long)(int64_t)(now - rel) / 10000, MEM8(XBOX_FS_BASE + 0x24), n, MEM8(v + 0x65),
+            MEM32(v + 0x4C) == v + 0x4C ? "self-linked" : "linked", MEM32(v + 8), MEM32(MEM32(v + 8) + 0x84));
+    for (i = 0; i < n && i < 4; i++) {
+        uint32_t h = MEM16(v + 0xC + 2 * i), b = vblocks + h * 0x80;
+        fprintf(stderr, "  [DSWAIT]   hw voice %u: state 0x%08X link 0x%08X\n", h, MEM32(b + 0x54), MEM32(b + 0x7C));
+    }
+}
+
+void sub_001F30B4(void)
+{
+    static int test = -1, tested;
+    static unsigned nstuck, nlong;
+    uint32_t obj = g_ecx, ret = MEM32(g_esp), i, testcore = 0;
+    uint64_t t0 = 0, now = 0;
+    int mode = ds_voicewait(), told = 0;
+    if (!mode) {
+        sub_001F30B4_gen();
+        return;
+    }
+    if (test < 0) {
+        const char *e = getenv("RECOMP_TEST_VOICEWAIT_STUCK");
+        test = e && *e ? atoi(e) : 0;
+    }
+    if (MEM8(obj + 0x12) & 1) {
+        xbox_KeQuerySystemTime(&t0);
+        if (test && !tested && ret == 0x001F41A8u && (MEM16(obj + 0x12) & 0x8000)) {
+            for (i = 0; i < 0x100 && MEM32(g_esp + i) != 0x0013058Du; i += 4)
+                ;
+            if (i < 0x100) {
+                tested = 1;
+                ds_log_voice("test: forcing this release wait to stick", obj);
+                MEM16(obj + 0x12) &= 0xFFFE;
+                if (test >= 2) {
+                    testcore = MEM32(obj + 8);
+                    MEM32(testcore + 0x84) += 1;
+                    MEM32(obj + 0x7C) += 9;   /* + 9 << 32 x 100 ns: about an hour */
+                    MEM16(obj + 0x12) |= 1;
+                }
+            }
+        }
+        for (i = 0; MEM16(obj + 0x12) & 0x8000; i++) {
+            if ((i & 1023) == 1023) {
+                xbox_KeQuerySystemTime(&now);
+                if ((int64_t)(now - t0) > 20000000) {
+                    if (!told && nstuck++ < 32) {
+                        ds_log_voice(mode == 1 ? "release wait still running after 2 s; ending it"
+                                               : "release wait still running after 2 s", obj);
+                        fprintf(stderr, "  [DSWAIT]   called from 0x%08X;", ret);
+                        ds_log_stack();
+                    }
+                    told = 1;
+                    if (mode == 1) {
+                        if ((MEM16(obj + 0x12) & 0x8001) == 0x8001) {
+                            g_esp -= 4;
+                            MEM32(g_esp) = 0x001F30C6u;
+                            g_ecx = obj;
+                            sub_001F27B3();
+                        }
+                        MEM16(obj + 0x12) &= 0x7FFF;
+                        break;
+                    }
+                }
+            }
+            g_esp -= 4;
+            MEM32(g_esp) = 0x001F30C6u;
+            g_ecx = obj;
+            sub_001F289C();
+        }
+        if (testcore)
+            MEM32(testcore + 0x84) -= 1;
+        xbox_KeQuerySystemTime(&now);
+        if ((int64_t)(now - t0) > 4000000 && nlong++ < 32)
+            fprintf(stderr, "  [DSWAIT] release wait from 0x%08X on object 0x%08X took %lld ms (flags now 0x%04X)\n",
+                    ret, obj, (long long)(now - t0) / 10000, MEM16(obj + 0x12));
+    }
+    g_esp += 4; /* ret */
+}
+
+/* The toolkit's spin reports (kernel_bridge.c) land here; in sub_001F289C at its
+ * KeQuerySystemTime call, [esp+8] is the voice. */
+void pgr2_spin_report(uint32_t esp)
+{
+    if (MEM32(esp) == 0x001F28AEu && MEM32(esp + 0x18) == 0x001F30C6u)
+        ds_log_voice("busy release wait", MEM32(esp + 8));
+}
+
+/*
  * Test only: RECOMP_TEST_SUSPEND_RACE_MS=N recreates the race-end freeze of NOTES 17 on demand. The race
  * teardown (sub_0012D720) suspends the audio meter thread through XAPI SuspendThread (sub_0018F419, from
  * 0x12D799). Here a host helper thread holds DirectSound's API lock (0x1F6FA4) for N ms; the meter thread,

@@ -357,7 +357,7 @@ index 4a6389d..05fa71e 100644
  NTSTATUS __stdcall xbox_NtClearEvent(HANDLE EventHandle);
  NTSTATUS __stdcall xbox_NtCreateMutant(PHANDLE MutantHandle, PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, BOOLEAN InitialOwner);
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index 10d00f4..755983c 100644
+index 10d00f4..9b6118f 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -461,7 +461,8 @@ static RECOMP_TLS uint32_t g_thread_stack_top = 0;
@@ -542,7 +542,18 @@ index 10d00f4..755983c 100644
      else
          g_eax = 0;
  }
-@@ -10827,6 +10936,35 @@ static void kernel_thunk_dispatch_body(void)
+@@ -10801,6 +10910,10 @@ static void kernel_thunk_dispatch(void)
+         xbox_GuestCpuAcquire();
+ }
+ 
++/* A title can name its own busy loops: called after a spin report below, on
++ * the spinning thread, with its guest esp (set by the title's main). */
++void (*xbox_spin_report_hook)(uint32_t esp);
++
+ static void kernel_thunk_dispatch_body(void)
+ {
+     int slot = g_kernel_dispatch_slot;
+@@ -10827,6 +10940,50 @@ static void kernel_thunk_dispatch_body(void)
      if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
          g_ordinal_calls[ordinal]++;
  
@@ -552,14 +563,27 @@ index 10d00f4..755983c 100644
 +         * in one calling KeQuerySystemTime 5 million times a second, with
 +         * no way to tell afterwards which loop). Once per thread, the guest
 +         * return addresses on its stack, innermost first. */
-+        static RECOMP_TLS uint32_t spin_ord, spin_n;
++        /* RECOMP_SPIN_REPORT=N lowers the count to N and reports each new
++         * esp (up to 16), for loops that end on their own. */
++        static RECOMP_TLS uint32_t spin_ord, spin_n, spin_esp;
 +        static RECOMP_TLS int spin_told;
++        static uint32_t spin_limit;
++        static volatile LONG spin_reports;
++        if (!spin_limit) {
++            const char *e = getenv("RECOMP_SPIN_REPORT");
++            spin_limit = e && *e ? (uint32_t)strtoul(e, NULL, 0) : 20000000u;
++            if (!spin_limit)
++                spin_limit = 20000000u;
++        }
 +        if (ordinal != spin_ord) {
 +            spin_ord = ordinal;
 +            spin_n = 0;
-+        } else if (++spin_n == 20000000u && !spin_told) {
++        } else if (++spin_n == spin_limit
++                   && (spin_limit < 20000000u ? g_esp != spin_esp && spin_reports < 16 : !spin_told)) {
 +            uint32_t a, n = 0, s = g_esp;
 +            spin_told = 1;
++            spin_esp = s;
++            InterlockedIncrement(&spin_reports);
 +            fprintf(stderr, "  [KERNEL] thread %lu: ordinal %u called %u times in a row, esp=0x%08X;"
 +                    " image addresses on its stack:", (unsigned long)GetCurrentThreadId(),
 +                    ordinal, spin_n, s);
@@ -571,6 +595,8 @@ index 10d00f4..755983c 100644
 +                }
 +            }
 +            fprintf(stderr, "\n");
++            if (xbox_spin_report_hook)
++                xbox_spin_report_hook(s);
 +            fflush(stderr);
 +        }
 +    }
@@ -578,6 +604,50 @@ index 10d00f4..755983c 100644
      if (KERNEL_LOG_ON()) {
          /* The guest return address sits at the top of the guest stack: the
           * caller pushed it before dispatching here. Logging it turns "some
+@@ -10868,6 +11025,43 @@ static void kernel_thunk_dispatch_body(void)
+                             (unsigned long long)g_ordinal_calls[best]);
+                 }
+             }
++            /* Two summaries in a row landing on the same thread, ordinal and
++             * esp, with a million calls of it in between: a busy loop the
++             * "in a row" count above can miss, because interrupts serviced
++             * on that thread make other kernel calls in between (PGR2's
++             * race-end KeQuerySystemTime spin, NOTES 17). The summary runs
++             * on the calling thread, so its stack is safe to read. */
++            {
++                static DWORD sum_tid;
++                static ULONG sum_ord;
++                static uint32_t sum_esp;
++                static unsigned long long sum_cnt;
++                static int sum_told;
++                DWORD tid = GetCurrentThreadId();
++                if (!sum_told && tid == sum_tid && ordinal == sum_ord && g_esp == sum_esp
++                    && ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE
++                    && g_ordinal_calls[ordinal] - sum_cnt > 1000000u) {
++                    uint32_t a, n = 0, s = g_esp;
++                    sum_told = 1;
++                    fprintf(stderr, "  [KERNEL] thread %lu: busy loop on ordinal %u (%llu calls since the last"
++                            " summary, same esp=0x%08X); image addresses on its stack:", (unsigned long)tid,
++                            ordinal, g_ordinal_calls[ordinal] - sum_cnt, s);
++                    for (a = s; a < s + 0x1000 && n < 40; a += 4) {
++                        uint32_t v = BRIDGE_MEM32(a);
++                        if (v >= 0x00011000u && v < g_xbox_image_hi) {
++                            fprintf(stderr, " %08X@+%X", v, a - s);
++                            n++;
++                        }
++                    }
++                    fprintf(stderr, "\n");
++                    if (xbox_spin_report_hook)
++                        xbox_spin_report_hook(s);
++                }
++                sum_tid = tid;
++                sum_ord = ordinal;
++                sum_esp = g_esp;
++                sum_cnt = ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE ? g_ordinal_calls[ordinal] : 0;
++            }
+             fflush(stderr);
+             last_summary_tick = now;
+         }
 diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
 index eb33a61..7ec2611 100644
 --- a/src/kernel/kernel_file.c

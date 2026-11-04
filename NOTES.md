@@ -676,6 +676,59 @@ stays a list; 2 logs only; 0 is off. A drain that finds a broken link logs `[DSL
 Silent so far: the user's KeQuerySystemTime spin (the self-linked node) has not recurred, so its cause is still
 open; the next one names its inserter.
 
+**The KeQuerySystemTime spin is DirectSound's release wait, not a list (2026-11-03; guarded, cause of the stuck
+voice still open).** The user's `run.log` of 2026-11-03 09:49 (60 fps, vsync) froze at its first race end with the
+earlier fix in place (`suspended outside any guest lock`): after `uifont`, the main thread at esp `0x00F7F1A4`
+called KeQuerySystemTime ~5 million times a second for minutes, KfRaiseIrql/KfLowerIrql flat, no `[DSLIST]` line.
+The old spin detector stayed silent because interrupts serviced on the spinning thread make other kernel calls
+and reset its "in a row" count. Two toolkit additions (kernel_bridge.c): a summary-based report (`[KERNEL] thread N:
+busy loop on ordinal X (... since the last summary, same esp ...)`, two 2-s summaries on the same thread, ordinal and
+esp a million calls apart) and `RECOMP_SPIN_REPORT=N`, which lowers the in-a-row count to N and reports each new esp
+(up to 16), for loops that end by themselves; both call `xbox_spin_report_hook`, which main.c points at
+`pgr2_spin_report` (recomp_manual.c).
+
+With `RECOMP_SPIN_REPORT=5000` a normal run names the loop: every race end the main thread passes through the
+same esp `0x00F7F1A4`, in DirectSound's **release wait** `sub_001F30B4`: `if (flags & 1) while (flags & 0x8000)
+sub_001F289C()` (flags = voice object `+0x12`), called from the stream release `sub_001F4194` (`0x1F41A8`) under
+`IDirectSoundStream::Release` (`0x1F4352 <- 0x1EB647 <- ... <- 0x1EB888 <- 0x13058D`, the race teardown, holding
+DirectSound's API critical section). Streams and buffers both wait there (also from `0x1F13E9`, buffer stop, on the
+game threads during a race: the multi-million KeQuerySystemTime bursts in every log). `sub_001F289C`: if
+`(flags & 0x8001) == 0x8001`, read the time and, 0.5 s after the release time at `+0x78` (written by the release
+`sub_001F319E`), call Stop (`sub_001F27B3`); otherwise call vtable `+0x20` (a timer dequeue, `sub_001F07D1`). What
+clears 0x8000: only `sub_001F25D7` (unlink from the mixbin list), from the idle-voice trap handler `sub_001F01B8`
+or from Stop. The handler ignores the trap while any release is mid-flight (core `+0x84`) or when the voice's list
+entry (`+0x4C`) is already self-linked; the VP re-raises the trap every frame while the voice stays linked and
+idle, so one ignored trap only delays the wait. Normally the waits end within milliseconds.
+
+So the freeze is a release wait that neither the trap nor the timeout ends. With KfRaiseIrql flat (the main thread
+is at IRQL 0 there, logged), the loop cannot have been on the vtable `+0x20` branch (it takes DirectSound's IRQL
+lock each pass) or calling Stop; it was on the time branch with the timeout never coming due, i.e. `+0x78` ahead
+of the clock, and no trap. How the voice gets there is not known: no write to `+0x78` other than the release's own
+KeQuerySystemTime was found, and the lifted 64-bit compare is right. Things ruled out: the suspend case (the suspend was logged
+`outside any guest lock`, and the main thread was running, not blocked on a lock), the DSOUND list self-link (no `[DSLIST]`; the
+drains never ran), our KeQuerySystemTime (monotonic, performance-counter based). Clearing bit 0x1 mid-wait alone
+does not hang it (run vw2: the trap still came and ended the wait). One difference from every scripted run: the
+user's 2-minute race had 4 `[APU] stale idle-voice trap retracted: voice N no longer in a list` (pairs: 136/137,
+179/180, stereo voices), the scripted 14-s races none.
+
+Guard, game side (`recomp_manual.c` `sub_001F30B4`, `patch_gen.py` renames the generated one to `*_gen`):
+`RECOMP_DS_VOICEWAIT=1` (default) runs the same loop and, if a wait is still running 2 s after it began, logs
+`[DSWAIT] release wait still running after 2 s; ending it` with the voice's flags, how long ago it was released,
+IRQL, list entry, core busy count and hardware voice state/link plus the guest stack, then ends it as the timeout
+would (Stop when `0x8001` are set, then clear 0x8000); 2 logs only (the wait cannot end); 0 runs the generated loop.
+Any wait over 400 ms logs `[DSWAIT] release wait from X on object Y took N ms`. Test knob
+`RECOMP_TEST_VOICEWAIT_STUCK=2` forces the state on the race end's stream release (blocks the trap through core
+`+0x84`, moves `+0x78` an hour ahead; 1 only clears bit 0x1). Verified: with `RECOMP_DS_VOICEWAIT=2` (run vw4) the
+first race end froze exactly like the user's run (after `uifont`, main spinning on KeQuerySystemTime at esp
+`0x00F7F1A8` -- 4 bytes off the user's because the wrapper does not push esi -- KfRaise/LowerIrql flat, no
+`Listener.dat`); with the default (vw5) the wait ended after 2001 ms (`flags now 0x0101`), the front end loaded
+and three more race ends came back.
+
+Natural rate: not reproduced here. Scripted 14-s races at 60 fps: 15 race ends before the guard (rf1, rf3) and 12
+with it (vs1) all came back; in vs1 no wait passed 400 ms and the guard never fired. The user's one natural freeze
+came after a 2-minute race, so the before/after rate can only come from the user's own races. The next natural occurrence is logged with the voice's state, which says how it got
+stuck.
+
 ## 18. 60 fps races at real-time speed: the game's own PresentInterval (`RECOMP_PRESENT_INTERVAL=1`)
 
 Races run at 30 fps because the title asks for presentation interval 2 (13). It is a setting, not an assumption:
@@ -839,8 +892,11 @@ vertices) and hitting the cap logs `[GPU] immediate batch over N vertices` once.
 0. Sunlit road (15): the darkening was the car-shadow receiver without alpha kill / shadow compare (fixed, with
    polygon offset); the two leftover wedges were the sampler's missing border colour (fixed). Matches xemu at the
    plaza spot.
-1. The DirectSound list corruption of 17 (the user's KeQuerySystemTime spin): not seen since; `RECOMP_DS_LISTCHECK`
-   logs the inserter of a queued node and repairs it. Port `xbox_SuspendGuestThread` (17) to rsc2/mm3's patch.
+1. The user's KeQuerySystemTime spin (17) is DirectSound's release wait `sub_001F30B4` never ending; guarded by
+   `RECOMP_DS_VOICEWAIT` (ends it after 2 s, logs `[DSWAIT]`). Not reproduced naturally; the next `[DSWAIT] ... still
+   running after 2 s` line says how the voice got stuck (flags, release time vs now, trap state). The DSOUND list
+   self-link theory had no evidence; `RECOMP_DS_LISTCHECK` stays as a probe. Port `xbox_SuspendGuestThread` (17)
+   to rsc2/mm3's patch.
 2. The user drives a full race (window, input feel, audio); the black player car (xemu shader cache comparison).
 3. More CRT x87 entries may surface as `[ICALL] Failed 0x001B5xxx/0x001B9xxx`: seed the table entry / stub
    target (10). SEH handlers referenced from `.rdata` (`0x001B2F48`, `0x001B85D9`, ...) are not seeded.

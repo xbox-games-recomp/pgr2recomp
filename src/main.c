@@ -490,6 +490,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         const char *e = getenv("RECOMP_DEFER_IO_APC");
         xbox_SetDeferredIoApc(!(e && *e == '0'));
     }
+    {
+        /* The toolkit's busy-loop reports name DirectSound's voice wait (NOTES 17). */
+        extern void (*xbox_spin_report_hook)(uint32_t esp);
+        extern void pgr2_spin_report(uint32_t esp);
+        xbox_spin_report_hook = pgr2_spin_report;
+    }
 
     /* Step 6: Initialize stack */
     g_esp = XBOX_STACK_TOP;
