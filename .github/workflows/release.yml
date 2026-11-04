@@ -19,7 +19,7 @@ jobs:
   package:
     runs-on: windows-latest
     steps:
-      # Kept as a real git checkout: setup applies the toolkit/SDK patches with git.
+      # Kept as a real git checkout: setup applies patches\xboxrecomp.patch with git.
       - uses: actions/checkout@v4
         with:
           path: ${{ env.NAME }}
