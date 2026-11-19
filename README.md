@@ -78,9 +78,14 @@ repository root.
 
 | Launcher setting | Variable | Default | Effect |
 |---|---|---|---|
-| Internal resolution | `RECOMP_D3D11_RES` | `2` | 1–6 × 640x480; above the window size it is supersampling. The window keeps 4:3 |
-| FXAA edge smoothing | `RECOMP_D3D11_FXAA` | off | FXAA at present |
+| Fullscreen | `RECOMP_FULLSCREEN` | off | Borderless; Alt+Enter switches while playing |
+| Aspect ratio, Window size | `RECOMP_WINDOW_WIDTH` / `_HEIGHT` | 4:3, 960×720 | Sizes offered by aspect ratio; the picture keeps 4:3 |
+| Resolution scale | `RECOMP_D3D11_RES` | `2` | 1–6 × 640x480; above the window size it is supersampling |
+| Anti-aliasing | `RECOMP_D3D11_FXAA` | none | `1` FXAA, `2` FXAA (extreme) |
+| Scaling to the window | `RECOMP_D3D11_PRESENT_EFFECT` | `bilinear` | `cas` (sharpen), `fsr` (FSR 1 upscale + sharpen) |
+| Anisotropic filtering | `RECOMP_D3D11_ANISO` | `-1` (game) | `0` off, `1`–`5` = 1x–16x |
 | Vertical sync | `RECOMP_D3D11_VSYNC` | on | |
+| Frame stats in the title bar | `RECOMP_TITLE_STATS` | on | |
 | Race frame rate | `RECOMP_PRESENT_INTERVAL` | `2` (30 fps) | `1` = 60 fps through the game's own PresentInterval; the race slows down whenever the PC drops a frame |
 | Keyboard controls | `RECOMP_KEYBOARD` | on | Keyboard as a pad |
 | Rumble | `RECOMP_RUMBLE` | on | |
@@ -88,8 +93,9 @@ repository root.
 | Hang watchdog | `RECOMP_WATCHDOG_SECS` | `900` | Dump the game's state to the log after this long without progress |
 | Flight recorder | `RECOMP_D3D11_RING` | `240` | F12 saves the last N frames to `flicker\` |
 
-**Controls:** XInput pads map 1:1 to the Xbox pad. Keyboard: arrows = D-pad, Enter = Start, Z/X/C/V = A/B/X/Y,
-WASD = left stick, 1/3 = triggers. Press Start (not A) at the title screen; A starts the attract demo.
+**Controls:** XInput pads map 1:1 to the Xbox pad. Keyboard (on by default): arrows = D-pad, Enter = Start, Backspace = Back, Z/X/C/V = A/B/X/Y,
+Q/E = White/Black, 1/3 = triggers, WASD = left stick, IJKL = right stick, Shift/Ctrl = stick clicks; the same
+layout as every xbox-games-recomp port. Press Start (not A) at the title screen; A starts the attract demo.
 
 Saves go to `%LOCALAPPDATA%\xboxrecomp\UDATA\4d53004b` (the launcher's **Saves** page); `RECOMP_SAVE_ROOT`
 moves the whole save tree for test runs.
