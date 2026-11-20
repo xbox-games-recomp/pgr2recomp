@@ -1,5 +1,7 @@
 # Project Gotham Racing 2 — Static Recompilation
 
+![The launcher](docs/launcher.png)
+
 ![Racing in Hong Kong](docs/hong_kong_race.png)
 
 A native Windows (x64) port of the original-Xbox *Project Gotham Racing 2* (Bizarre Creations / Microsoft, 2003).
