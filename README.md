@@ -17,7 +17,8 @@ changes in `patches/xboxrecomp.patch`, scaffolded from rsc2recomp and
 > (generated C, builds, logs, dumps) is git-ignored.
 
 **Status:** intro movies, menus, car selection and full street races with their replays, with audio and a
-gamepad or keyboard. Races run at the console's 30 fps; 60 fps is an option. The player's car renders too dark
+gamepad or keyboard, in 4:3 or the game's own 16:9 widescreen mode. Races run at the console's 30 fps; 60 fps
+is an option. The player's car renders too dark
 (see [Open issues](#open-issues)).
 
 ## Quick start
@@ -74,14 +75,17 @@ repository root.
 
 ## Running
 
-`pgr2_launcher.exe` sets the options below as environment variables, starts the game and logs to `run.log`;
-`--play` skips the window. Other variables go on its **Launcher** page. Starting the exe yourself, set the
+`pgr2_launcher.exe` sets the options below as environment variables, starts the game and logs to `run.log`
+(the run before is kept as `run.prev.log`); `--play` skips the window. Only one launcher window opens
+(starting it again brings that window to the front), and Play does nothing while the game is already
+running. Other variables go on its **Launcher** page. Starting the exe yourself, set the
 `[env]` variables from `launcher.ini` first: without them the game does not run.
 
 | Launcher setting | Variable | Default | Effect |
 |---|---|---|---|
 | Fullscreen | `RECOMP_FULLSCREEN` | off | Borderless; Alt+Enter switches while playing |
-| Aspect ratio, Window size | `RECOMP_WINDOW_WIDTH` / `_HEIGHT` | 4:3, 960×720 | Sizes offered by aspect ratio; the picture keeps 4:3 |
+| Aspect ratio | `RECOMP_ASPECT` | 4:3 | Anything but 4:3 plays the game's own 16:9 widescreen mode (`RECOMP_WIDESCREEN=1`, NOTES 23) |
+| Window size | `RECOMP_WINDOW_WIDTH` / `_HEIGHT` | 960×720 | Sizes offered by aspect ratio |
 | Resolution scale | `RECOMP_D3D11_RES` | `2` | 1–6 × 640x480; above the window size it is supersampling |
 | Anti-aliasing | `RECOMP_D3D11_FXAA` | none | `1` FXAA, `2` FXAA (extreme) |
 | Scaling to the window | `RECOMP_D3D11_PRESENT_EFFECT` | `bilinear` | `cas` (sharpen), `fsr` (FSR 1 upscale + sharpen) |
