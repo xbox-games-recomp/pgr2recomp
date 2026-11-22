@@ -1,5 +1,5 @@
-# Packages a Windows release on every v* tag (or by hand, as a build artifact): the source as a shallow
-# clone with its submodules, plus pgr2_launcher.exe at the root. No game content and nothing built from it:
+# Packages a Windows release on every v* tag (or by hand, as a build artifact): the source with its
+# submodules but no git metadata, plus pgr2_launcher.exe at the root. No game content and nothing built from it:
 # players unzip it, run the launcher, and its Setup page builds the game from their own disc.
 name: release
 
@@ -19,7 +19,6 @@ jobs:
   package:
     runs-on: windows-latest
     steps:
-      # Kept as a real git checkout: setup applies patches\xboxrecomp.patch with git.
       - uses: actions/checkout@v4
         with:
           path: ${{ env.NAME }}
@@ -37,7 +36,9 @@ jobs:
         run: |
           $ver = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { $env:GITHUB_SHA.Substring(0, 7) }
           $zip = "$env:NAME-$ver-windows.zip"
-          # 7z keeps the hidden .git folders that Compress-Archive leaves out.
+          # No git metadata in the zip: the submodules' .git files point at ..\.git\modules, which does not
+          # survive every unzip tool, and a dangling one breaks scripts\apply_patches.ps1. Setup needs no history.
+          Get-ChildItem $env:NAME -Recurse -Force -Filter .git | Remove-Item -Recurse -Force
           7z a -tzip $zip $env:NAME | Out-Null
           if ($LASTEXITCODE) { exit 1 }
           "zip=$zip" >> $env:GITHUB_OUTPUT

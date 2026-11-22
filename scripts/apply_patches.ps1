@@ -14,12 +14,15 @@ if (-not (Test-Path (Join-Path $tk "CMakeLists.txt"))) {
     throw "xboxrecomp submodule is empty. Run: git submodule update --init"
 }
 
-git -C $tk apply --reverse --check $patch 2>$null
+# Run from the project root with --directory, not inside xboxrecomp: a release zip has no git metadata, and a
+# leftover xboxrecomp\.git link file pointing at a missing ..\.git\modules folder makes git -C xboxrecomp fail.
+$apply = @("-C", $root, "apply", "--directory=xboxrecomp")
+git @apply --reverse --check $patch 2>$null
 if ($LASTEXITCODE -eq 0) { "xboxrecomp patch already applied"; return }
 
-git -C $tk apply --check $patch
+git @apply --check $patch
 if ($LASTEXITCODE -ne 0) {
-    throw "xboxrecomp patch does not apply. Is the submodule at the pinned commit? (git submodule update)"
+    throw "xboxrecomp patch does not apply (git's error is above). Is the submodule at the pinned commit? (git submodule update)"
 }
-git -C $tk apply $patch
+git @apply $patch
 "xboxrecomp patch applied"
